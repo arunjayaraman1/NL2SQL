@@ -1,0 +1,11 @@
+.env
+.cursorignore
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+.cursor/
+.cursorignore
+.cursorignore
