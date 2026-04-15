@@ -369,5 +369,5 @@ docker exec -it nl2sql-db psql -U postgres -d hr_db -c "\dt"
 ---
 
 ## License
-
-MIT
+ 
+Private Project
