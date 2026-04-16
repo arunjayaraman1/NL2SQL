@@ -1,4 +1,4 @@
-langchain-groq
+langchain-nvidia-ai-endpoints
 langgraph
 psycopg2-binary
 python-dotenv

@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r backend/requirements.txt
 COPY backend ./backend
 COPY sql_prompt.py ./sql_prompt.py
 COPY hr_examples.py ./hr_examples.py
+COPY profiler.py ./profiler.py
 
 EXPOSE 8000
 

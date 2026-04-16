@@ -9,19 +9,37 @@ With Retry Loop: If SQL execution fails, retry up to 3 times with error feedback
 """
 
 import os
-from typing import TypedDict
+import sys
+import argparse
+from typing import TypedDict, Optional
 
 import psycopg2
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
 from langgraph.graph import END, StateGraph
 
-from sql_prompt import build_sql_generation_prompt
+from sql_prompt import build_sql_generation_prompt, build_profiled_schema_prompt
+from profiler import profile_database, ProfileCache
 
 # Load environment variables from .env file
 load_dotenv()
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-2-2b-it")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_TEMPERATURE = float(os.getenv("NVIDIA_TEMPERATURE", "0.2"))
+NVIDIA_TOP_P = float(os.getenv("NVIDIA_TOP_P", "0.7"))
+NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "1024"))
+
+
+def build_llm_client() -> ChatNVIDIA:
+    return ChatNVIDIA(
+        model=NVIDIA_MODEL,
+        api_key=NVIDIA_API_KEY,
+        temperature=NVIDIA_TEMPERATURE,
+        top_p=NVIDIA_TOP_P,
+        max_tokens=NVIDIA_MAX_TOKENS,
+    )
 
 
 # =============================================================================
@@ -46,6 +64,7 @@ class GraphState(TypedDict):
     sql_query: str  # Output of generate_sql: LLM-generated SQL
     result: str  # Output of execute_sql: Query results or error
     iteration: int  # Track retry attempts
+    profile_cache: Optional[ProfileCache]  # Profiling metadata cache
 
 
 # =============================================================================
@@ -126,7 +145,7 @@ def fix_sql_with_error(sql: str, error_msg: str, schema: str) -> str:
     """
     Ask the LLM to fix the SQL query based on the error message.
     """
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+    llm = build_llm_client()
 
     prompt = f"""You are a PostgreSQL SQL expert. The following SQL query has an error:
 
@@ -169,36 +188,29 @@ Corrected SQL:"""
 
 def fetch_schema(state: GraphState) -> GraphState:
     """
-    NODE 1: Fetches the database schema from PostgreSQL.
+    NODE 1: Fetches the database schema from PostgreSQL with profiling metadata.
 
-    Queries information_schema to get all tables and columns
-    from the public schema.
+    Uses the profiler module to extract statistical metadata including:
+    - Null counts and percentages
+    - Distinct value counts
+    - Sample values
+    - Min/Max for numeric and date columns
+    - Primary key and foreign key relationships
     """
     conn = get_db_connection()
-    cursor = conn.cursor()
 
-    query = """
-        SELECT table_name, column_name, data_type 
-        FROM information_schema.columns 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name, ordinal_position
-    """
+    try:
+        profile_cache = profile_database(
+            conn, force_refresh=state.get("force_refresh", False)
+        )
+        state["profile_cache"] = profile_cache
 
-    cursor.execute(query)
-    columns = cursor.fetchall()
+        from profiler import format_profiled_schema
 
-    schema_lines = []
-    current_table = None
-    for table, column, dtype in columns:
-        if table != current_table:
-            schema_lines.append(f"\nTable: {table}")
-            current_table = table
-        schema_lines.append(f"  - {column} ({dtype})")
+        state["schema"] = format_profiled_schema(profile_cache)
 
-    state["schema"] = "\n".join(schema_lines)
-
-    cursor.close()
-    conn.close()
+    finally:
+        conn.close()
 
     return state
 
@@ -211,10 +223,14 @@ def fetch_schema(state: GraphState) -> GraphState:
 def generate_sql(state: GraphState) -> GraphState:
     """
     NODE 2: Generates SQL query from natural language using LLM.
+    Uses profiled schema for enhanced accuracy.
     """
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+    llm = build_llm_client()
 
-    prompt = build_sql_generation_prompt(state["schema"], state["question"])
+    if state.get("profile_cache"):
+        prompt = build_profiled_schema_prompt(state["profile_cache"], state["question"])
+    else:
+        prompt = build_sql_generation_prompt(state["schema"], state["question"])
 
     response = llm.invoke(prompt)
     state["sql_query"] = response.content.strip()
@@ -312,7 +328,7 @@ def execute_sql(state: GraphState) -> GraphState:
 # =============================================================================
 
 
-def run_pipeline(question: str) -> dict:
+def run_pipeline(question: str, initial_state: GraphState = None) -> dict:
     """
     Builds and executes the complete LangGraph workflow with retry support.
     """
@@ -333,14 +349,18 @@ def run_pipeline(question: str) -> dict:
     # Compile
     compiled = workflow.compile()
 
-    # Initial state
-    initial_state = GraphState(
-        question=question,
-        schema="",
-        sql_query="",
-        result="",
-        iteration=0,
-    )
+    if initial_state is None:
+        initial_state = GraphState(
+            question=question,
+            schema="",
+            sql_query="",
+            result="",
+            iteration=0,
+            profile_cache=None,
+        )
+
+    if "profile_cache" not in initial_state:
+        initial_state["profile_cache"] = None
 
     # Execute
     final_state = compiled.invoke(initial_state)
@@ -354,26 +374,82 @@ def run_pipeline(question: str) -> dict:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="NL2SQL - Natural Language to SQL Converter"
+    )
+    parser.add_argument(
+        "--refresh-profile",
+        action="store_true",
+        help="Force refresh the database profile cache before querying",
+    )
+    parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help="Only refresh the profile cache, then exit",
+    )
+    parser.add_argument("question", nargs="?", help="Your natural language question")
+
+    args = parser.parse_args()
+
+    if args.refresh_profile or args.profile_only:
+        print("=" * 60)
+        print("NL2SQL - Database Profiling")
+        print("=" * 60)
+        print("\nRefreshing profile cache...")
+
+        conn = get_db_connection()
+        try:
+            profile_cache = profile_database(conn, force_refresh=True)
+            from profiler import format_profiled_schema
+
+            print(f"\nSuccessfully profiled {len(profile_cache.tables)} tables:")
+            for table_name, table in profile_cache.tables.items():
+                print(
+                    f"  - {table_name}: {table.row_count} rows, {table.column_count} columns"
+                )
+
+            print("\nFormatted schema preview:")
+            print(format_profiled_schema(profile_cache)[:500] + "...")
+
+            print(
+                f"\nProfile cache saved. Expires in {profile_cache.expires_in_seconds} seconds."
+            )
+        finally:
+            conn.close()
+
+        if args.profile_only:
+            sys.exit(0)
+
+        if not args.question:
+            print("\nProfile refreshed. Run again with a question.")
+            sys.exit(0)
+
     print("=" * 60)
     print("NL2SQL - Natural Language to SQL Converter")
     print("With Retry Support (max 3 iterations per query)")
     print("=" * 60)
 
-    # Get question from user
-    question = input("\nEnter your question: ")
+    question = args.question if args.question else input("\nEnter your question: ")
 
     print("\nProcessing...")
 
-    # Run the pipeline
-    result = run_pipeline(question)
+    initial_state = GraphState(
+        question=question,
+        schema="",
+        sql_query="",
+        result="",
+        iteration=0,
+        profile_cache=None,
+        force_refresh=args.refresh_profile,
+    )
 
-    # Display results
+    result = run_pipeline(question, initial_state)
+
     print("\n--- Generated SQL ---")
     print(result["sql_query"])
 
     print("\n--- Results ---")
     print(result["result"])
 
-    # Show iteration count if retries were used
     if result.get("iteration", 0) > 0:
         print(f"\n(Completed in {result['iteration']} attempt(s))")

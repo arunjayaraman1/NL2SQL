@@ -3,7 +3,7 @@ import sys
 import json
 import subprocess
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Optional
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -13,13 +13,31 @@ import psycopg2
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-from sql_prompt import build_sql_generation_prompt
+from sql_prompt import build_sql_generation_prompt, build_profiled_schema_prompt
+from profiler import profile_database, load_profile_cache, ProfileCache
 
 load_dotenv()
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-2-2b-it")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_TEMPERATURE = float(os.getenv("NVIDIA_TEMPERATURE", "0.2"))
+NVIDIA_TOP_P = float(os.getenv("NVIDIA_TOP_P", "0.7"))
+NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "1024"))
 DEFAULT_CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
+
+_profile_cache: Optional[ProfileCache] = None
+
+
+def build_llm_client() -> ChatNVIDIA:
+    return ChatNVIDIA(
+        model=NVIDIA_MODEL,
+        api_key=NVIDIA_API_KEY,
+        temperature=NVIDIA_TEMPERATURE,
+        top_p=NVIDIA_TOP_P,
+        max_tokens=NVIDIA_MAX_TOKENS,
+    )
 
 
 def get_cors_origins() -> list[str]:
@@ -44,6 +62,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Load profile cache on application startup."""
+    global _profile_cache
+    try:
+        conn = get_db_connection()
+        _profile_cache = profile_database(conn)
+        conn.close()
+        print(f"Profile cache loaded: {len(_profile_cache.tables)} tables")
+    except Exception as e:
+        print(f"Warning: Could not load profile cache: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown."""
+    pass
 
 
 # Retry state for tracking
@@ -216,9 +253,7 @@ def is_retryable_error(error_msg: str) -> bool:
 
 
 def generate_sql(schema, question):
-    from langchain_groq import ChatGroq
-
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+    llm = build_llm_client()
 
     prompt = build_sql_generation_prompt(schema, question)
 
@@ -239,9 +274,7 @@ def fix_sql_with_error(sql: str, error_msg: str, schema: str) -> str:
     """
     Ask the LLM to fix the SQL query based on the error message.
     """
-    from langchain_groq import ChatGroq
-
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+    llm = build_llm_client()
 
     prompt = f"""You are a PostgreSQL SQL expert. The following SQL query has an error:
 
@@ -529,6 +562,40 @@ def execute_sql_direct(sql: str) -> dict:
         return {"error": str(e)}
 
 
+@app.get("/api/profile")
+def get_profile():
+    """Return current profile metadata."""
+    global _profile_cache
+    if _profile_cache is None:
+        return {"error": "Profile not loaded"}
+    return {
+        "generated_at": _profile_cache.generated_at,
+        "expires_in_seconds": _profile_cache.expires_in_seconds,
+        "table_count": len(_profile_cache.tables),
+        "tables": list(_profile_cache.tables.keys()),
+        "row_counts": {
+            name: table.row_count for name, table in _profile_cache.tables.items()
+        },
+    }
+
+
+@app.post("/api/refresh-profile")
+def refresh_profile():
+    """Force refresh the profile cache."""
+    global _profile_cache
+    try:
+        conn = get_db_connection()
+        _profile_cache = profile_database(conn, force_refresh=True)
+        conn.close()
+        return {
+            "status": "refreshed",
+            "table_count": len(_profile_cache.tables),
+            "generated_at": _profile_cache.generated_at,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/databases")
 def get_databases():
     """Return available databases/table groups."""
@@ -537,14 +604,29 @@ def get_databases():
 
 @app.post("/api/query")
 def process_query(request: dict):
+    global _profile_cache
+
     question = request.get("question", "")
-    db_type = request.get("db_type", "hr")  # Default to HR database
+    db_type = request.get("db_type", "hr")
     use_retry = request.get("use_retry", True)
 
-    schema = fetch_schema(db_type)
+    if _profile_cache is None:
+        try:
+            conn = get_db_connection()
+            _profile_cache = profile_database(conn)
+            conn.close()
+        except Exception as e:
+            return {"error": f"Failed to load profile cache: {e}"}
+
+    filtered_tables = None
+    if db_type and db_type in AVAILABLE_DATABASES:
+        filtered_tables = AVAILABLE_DATABASES[db_type]["tables"]
+
+    from profiler import format_profiled_schema
+
+    schema = format_profiled_schema(_profile_cache, table_names=filtered_tables)
 
     if use_retry:
-        # Use retry loop (new behavior)
         result = generate_sql_with_retry(schema, question, max_iterations=3)
 
         if "error" in result:

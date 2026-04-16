@@ -9,3 +9,6 @@ __pycache__/
 .cursor/
 .cursorignore
 .cursorignore
+
+# Database profiling cache
+profile_cache.json

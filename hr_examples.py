@@ -148,19 +148,10 @@ EXAMPLE_VALUES = {
 
 def generate_few_shot_examples() -> list[FewShotExample]:
     """
-    Generate few-shot examples programmatically.
-    Returns a list of NL→SQL example pairs.
+    Generate few-shot examples for SQL generation.
+    Reduced to 5 diverse examples covering core patterns.
     """
-
     examples: list[FewShotExample] = [
-        # Example 1: List all employees
-        {
-            "question": "List all employees",
-            "sql": """SELECT id, first_name, last_name, email, hire_date
-FROM employees
-ORDER BY last_name, first_name;""",
-        },
-        # Example 2: Count employees by department
         {
             "question": "How many employees are in each department?",
             "sql": """SELECT d.name AS department, COUNT(e.id) AS employee_count
@@ -169,15 +160,6 @@ LEFT JOIN employees e ON d.id = e.department_id
 GROUP BY d.id, d.name
 ORDER BY employee_count DESC;""",
         },
-        # Example 3: Employees with their job titles
-        {
-            "question": "Show each employee with their job title",
-            "sql": """SELECT e.first_name, e.last_name, j.title AS job_title
-FROM employees e
-JOIN jobs j ON e.job_id = j.id
-ORDER BY e.last_name;""",
-        },
-        # Example 4: Filter employees by department
         {
             "question": "List employees in the Engineering department",
             "sql": """SELECT e.first_name, e.last_name, e.email
@@ -186,43 +168,23 @@ JOIN departments d ON e.department_id = d.id
 WHERE d.name = 'Engineering' AND e.is_active = TRUE
 ORDER BY e.last_name;""",
         },
-        # Example 5: Count by status
-        {
-            "question": "How many leave requests are pending?",
-            "sql": """SELECT status, COUNT(*) AS request_count
-FROM leave_requests
-WHERE status = 'pending'
-GROUP BY status;""",
-        },
-        # Example 6: Average salary by department
         {
             "question": "What is the average salary by department?",
-            "sql": """SELECT d.name AS department, 
-       ROUND(AVG(e.salary), 2) AS average_salary
+            "sql": """SELECT d.name AS department, ROUND(AVG(e.salary), 2) AS average_salary
 FROM departments d
 LEFT JOIN employees e ON d.id = e.department_id
 WHERE e.salary IS NOT NULL
 GROUP BY d.id, d.name
 ORDER BY average_salary DESC;""",
         },
-        # Example 7: Recent hires
-        {
-            "question": "Show employees hired after January 2023",
-            "sql": """SELECT first_name, last_name, hire_date, salary
-FROM employees
-WHERE hire_date > '2023-01-01'
-ORDER BY hire_date DESC;""",
-        },
-        # Example 8: Top paid employees
         {
             "question": "Show top 5 highest paid employees",
-            "sql": """SELECT first_name, last_name, salary, department_id
+            "sql": """SELECT first_name, last_name, salary
 FROM employees
 WHERE salary IS NOT NULL
 ORDER BY salary DESC
 LIMIT 5;""",
         },
-        # Example 9: Employees with no phone
         {
             "question": "Find employees with no phone number listed",
             "sql": """SELECT first_name, last_name, email
@@ -230,67 +192,7 @@ FROM employees
 WHERE phone IS NULL
 ORDER BY last_name;""",
         },
-        # Example 10: Department with most employees
-        {
-            "question": "Which department has the most employees?",
-            "sql": """SELECT d.name AS department, COUNT(e.id) AS employee_count
-FROM departments d
-LEFT JOIN employees e ON d.id = e.department_id
-GROUP BY d.id, d.name
-ORDER BY employee_count DESC
-LIMIT 1;""",
-        },
-        # Example 11: Leave balance summary
-        {
-            "question": "Show leave balance for each employee (vacation days)",
-            "sql": """SELECT e.first_name, e.last_name, lb.balance_days, lb.used_days
-FROM employees e
-JOIN leave_balances lb ON e.id = lb.employee_id
-WHERE lb.leave_type = 'vacation' AND lb.year = 2024
-ORDER BY lb.balance_days DESC;""",
-        },
-        # Example 12: Attendance summary
-        {
-            "question": "Show attendance count by status for each employee",
-            "sql": """SELECT e.first_name, e.last_name,
-       COUNT(CASE WHEN a.status = 'present' THEN 1 END) AS present_days,
-       COUNT(CASE WHEN a.status = 'absent' THEN 1 END) AS absent_days
-FROM employees e
-LEFT JOIN attendance_logs a ON e.id = a.employee_id
-WHERE a.date >= '2023-10-23'
-GROUP BY e.id, e.first_name, e.last_name
-ORDER BY present_days DESC;""",
-        },
-        # Example 13: Performance average by department
-        {
-            "question": "What is the average performance score by department?",
-            "sql": """SELECT d.name AS department, ROUND(AVG(pr.score), 2) AS avg_performance_score
-FROM departments d
-LEFT JOIN employees e ON d.id = e.department_id
-LEFT JOIN performance_reviews pr ON e.id = pr.employee_id
-WHERE pr.score IS NOT NULL
-GROUP BY d.id, d.name
-ORDER BY avg_performance_score DESC;""",
-        },
-        # Example 14: Employees with certifications
-        {
-            "question": "List employees with certifications that expire in 2024",
-            "sql": """SELECT e.first_name, e.last_name, c.cert_name, c.expiry_date
-FROM employees e
-JOIN certifications c ON e.id = c.employee_id
-WHERE c.expiry_date BETWEEN '2024-01-01' AND '2024-12-31'
-ORDER BY c.expiry_date;""",
-        },
-        # Example 15: Bonuses by year
-        {
-            "question": "Show total bonus amounts by year",
-            "sql": """SELECT year, SUM(amount) AS total_bonus, COUNT(*) AS bonus_count
-FROM bonuses
-GROUP BY year
-ORDER BY year DESC;""",
-        },
     ]
-
     return examples
 
 

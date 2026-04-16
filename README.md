@@ -1,12 +1,13 @@
 # NL2SQL - Natural Language to SQL Converter (HR Database)
 
-A full-stack application that converts natural language questions into SQL queries with interactive visualizations. Uses React, FastAPI, PostgreSQL (HR Database), and Groq LLM.
+A full-stack application that converts natural language questions into SQL queries with interactive visualizations. Uses React, FastAPI, PostgreSQL (HR Database), and NVIDIA LLM.
 
 ---
 
 ## Features
 
 - **Natural Language to SQL**: Ask questions in plain English, get SQL results
+- **Database Profiling Layer**: Smart metadata extraction (null counts, distinct values, samples, min/max, FK detection) cached for performance
 - **Conversation UI**: Multi-turn chat interface with sticky input
 - **Interactive Charts**: Bar, Line, and Pie charts using Chart.js
 - **Natural Language Summary**: Aggregated insights from query results
@@ -22,7 +23,7 @@ A full-stack application that converts natural language questions into SQL queri
 - Node.js 18+
 - PostgreSQL (local or Docker)
 - Docker & Docker Compose (optional)
-- Groq API Key (free at https://console.groq.com)
+- NVIDIA API Key
 
 ---
 
@@ -32,26 +33,24 @@ A full-stack application that converts natural language questions into SQL queri
 NL2SQL/
 ├── app.py                     # CLI pipeline with LangGraph
 ├── sql_prompt.py              # Shared NL→SQL prompt builder
-├── hr_schema.sql            # HR Database schema (17 tables)
-├── hr_examples.py           # Few-shot examples for HR queries
+├── profiler.py                # Database profiling module
+├── profile_cache.json         # Cached profile data (auto-generated, gitignored)
+├── hr_schema.sql              # HR Database schema (17 tables)
+├── hr_examples.py              # Few-shot examples (5 examples)
 ├── backend/
-│   ├── main.py             # FastAPI server
-│   └── requirements.txt    # Python dependencies
+│   ├── main.py                # FastAPI server
+│   └── requirements.txt       # Python dependencies
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx         # Main React component
-│   │   ├── components/    # UI components
-│   │   └── index.css       # Tailwind styles
-│   └── package.json       # Node dependencies
-├── docker-compose.yml      # Docker full stack
+│   │   ├── App.jsx            # Main React component
+│   │   ├── components/        # UI components
+│   │   └── index.css           # Tailwind styles
+│   └── package.json            # Node dependencies
+├── docker-compose.yml          # Docker full stack
 ├── docker/
 │   └── db/init/
-│       └── 02-hr_schema.sql  # HR schema for Docker
-└── .env.example           # Environment template
-
-Legacy files (previous version):
-├── school_data.sql         # School database schema
-├── README.md              # Previous version documentation
+│       └── 02-hr_schema.sql   # HR schema for Docker
+└── .env.example                # Environment template
 ```
 
 ---
@@ -88,7 +87,12 @@ DB_PORT=5432
 DB_NAME=hr_db
 DB_USER=postgres
 DB_PASSWORD=your_password
-GROQ_API_KEY=your_groq_api_key
+NVIDIA_API_KEY=your_nvidia_api_key
+NVIDIA_MODEL=google/gemma-2-2b-it
+NVIDIA_TEMPERATURE=0.2
+NVIDIA_TOP_P=0.7
+NVIDIA_MAX_TOKENS=1024
+PROFILE_CACHE_TTL=3600
 ```
 
 ---
@@ -175,46 +179,129 @@ Open your browser to: **http://localhost:3000**
 
 ---
 
+## API Endpoints
+
+### Query Endpoint
+
+```bash
+POST /api/query
+{
+  "question": "How many employees in each department?",
+  "db_type": "hr",
+  "use_retry": true
+}
+```
+
+### Profile Endpoints
+
+```bash
+# Get cached profile metadata
+GET /api/profile
+
+# Force refresh profile cache
+POST /api/refresh-profile
+
+# List available databases
+GET /api/databases
+```
+
+### CLI Options
+
+```bash
+# Query with cached profile
+python app.py "How many employees in each department?"
+
+# Refresh profile cache
+python app.py --refresh-profile
+
+# Refresh cache and exit
+python app.py --profile-only
+```
+
+---
+
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     User Interface                     │
-│                   (React + Chart.js)                │
-│                      Port 3000                      │
-└─────────────────────────────────────────────────────┘
-                           │
-                           ▼ POST /api/query
-┌─────────────────────────────────────────────────────┐
-│                   FastAPI Backend                     │
-│                (backend/main.py)                   │
-│                      Port 8000                     │
-├─────────────────────────────────────────────────────┤
-│  1. fetch_schema()     → Query information_schema  │
-│  2. build_prompt()      → Combine schema + Q      │
-│  3. Groq LLM            → Generate SQL           │
-│  4. execute_sql()      → Run against PostgreSQL │
-│  5. generate_summary() → Create NL insights     │
-│  6. Retry Loop         → Fix errors (max 3x)     │
-└─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────┐
-│                  PostgreSQL Database               │
-│                     (hr_db)                       │
-│                     Port 5432                     │
-└─────────────────────────────────────────────────────┘
+│                     User Interface                                  │
+│                   (React + Chart.js)                                 │
+│                      Port 3000                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼ POST /api/query
+┌─────────────────────────────────────────────────────────────────────┐
+│                        FastAPI Backend                              │
+│                     (backend/main.py)                               │
+│                         Port 8000                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Load Profile Cache    → Cached metadata from profiler.py        │
+│  2. Filter by db_type    → Only relevant tables                     │
+│  3. Format Schema        → Enriched schema with stats              │
+│  4. NVIDIA LLM           → Generate SQL with few-shots             │
+│  5. execute_sql()        → Run against PostgreSQL                   │
+│  6. generate_summary()   → Create NL insights                      │
+│  7. Retry Loop           → Fix errors (max 3x)                      │
+└─────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      PostgreSQL Database                            │
+│                         (hr_db)                                    │
+│                         Port 5432                                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 
 1. User enters natural language question
-2. Backend fetches database schema from `information_schema`
-3. Schema + user question + examples → sent to Groq LLM
+2. Backend loads cached profile metadata (or profiles fresh if needed)
+3. Schema + user question + 5 few-shot examples → sent to NVIDIA LLM
 4. LLM generates SQL query
 5. SQL executes against PostgreSQL (hr_db)
 6. Results returned with chart recommendations
 7. Frontend displays table + auto-detected chart
+
+---
+
+## Database Profiling Layer
+
+The system automatically extracts smart metadata from the database:
+
+### What is Profiled
+
+| Metric | Description |
+|--------|-------------|
+| **Null counts** | Percentage of NULL values per column |
+| **Distinct values** | Number of unique values |
+| **Sample values** | Top 5 most frequent values |
+| **Min/Max** | Range for numeric and date columns |
+| **Primary Keys** | Auto-detected from schema |
+| **Foreign Keys** | Auto-detected relationships |
+
+### Schema Format
+
+The profiled schema includes rich metadata:
+
+```sql
+Table: employees (25 rows, 12 columns)
+  - id: integer | non-null | 25 unique | PRIMARY KEY | sample: [1, 2, 3, 4, 5]
+  - first_name: varchar | non-null | 25 unique | avg_len=5.2 | sample: ["John", "Jane", "Mike"]
+  - department_id: integer | nullable (5% null) | 5 unique | FK→departments.id | sample: [1, 2, 3, 4, 5]
+  - hire_date: date | non-null | 25 unique | range: [2020-01-15, 2024-06-30]
+  - salary: numeric | nullable (8% null) | 20 unique | range: [30000, 150000]
+```
+
+### Caching
+
+| Setting | Default | Environment Variable |
+|---------|---------|---------------------|
+| Cache TTL | 1 hour | `PROFILE_CACHE_TTL` |
+| Cache file | `profile_cache.json` | `PROFILE_CACHE_FILE` |
+
+Force refresh:
+- API: `POST /api/refresh-profile`
+- CLI: `python app.py --refresh-profile`
 
 ---
 
@@ -245,6 +332,12 @@ Chart.js automatically selects visualization based on result structure:
 - Top item identification
 - Contextual insights per query
 
+### Database Profiling
+- Automatic metadata extraction on startup
+- Cached for performance (1 hour default)
+- Includes null counts, distinct values, samples, min/max
+- Auto-detects primary keys and foreign keys
+
 ### Retry Loop
 - Automatically retries on SQL errors
 - Analyzes error type (retryable vs non-retryable)
@@ -252,6 +345,7 @@ Chart.js automatically selects visualization based on result structure:
 - Non-retryable: permission denied, connection failed
 
 ### Error Handling
+
 | Error Type | Behavior |
 |------------|----------|
 | Table not found | Retry with LLM fix |
@@ -266,7 +360,7 @@ Chart.js automatically selects visualization based on result structure:
 ### Backend won't start
 - Check PostgreSQL is running
 - Verify `.env` credentials are correct
-- Ensure Groq API key is valid
+- Ensure NVIDIA API key is valid
 
 ### Frontend won't load
 - Ensure backend is running on port 8000
@@ -289,59 +383,30 @@ docker-compose up -d
 ### Docker: Permission denied
 - Ensure `.env` has correct `DB_USER` and `DB_PASSWORD`
 
----
+### Refresh profile cache
 
+```bash
+# Via API
+curl -X POST http://localhost:8000/api/refresh-profile
+
+# Via CLI
+docker exec -it nl2sql-backend python app.py --refresh-profile
+```
+
+---
 
 ## Files Overview
 
 | File | Description |
 |------|-------------|
-| `sql_prompt.py` | NL→SQL prompt: few-shots, dialect hints |
+| `sql_prompt.py` | NL→SQL prompt: few-shots (5), dialect hints, profiled schema support |
+| `profiler.py` | Database profiling with caching, FK detection, stats extraction |
 | `hr_schema.sql` | HR database schema (17 tables) |
-| `hr_examples.py` | Programmatic few-shot examples |
-| `backend/main.py` | FastAPI server with NL2SQL pipeline |
+| `hr_examples.py` | Few-shot examples (5 diverse patterns) |
+| `backend/main.py` | FastAPI server with NL2SQL pipeline, profile endpoints |
 | `frontend/src/App.jsx` | React UI with Chart.js |
 | `app.py` | CLI alternative with LangGraph |
 | `.env` | Database and API credentials |
-
----
-
-## Legacy: School Database (Previous Version)
-
-The original project used a **School Database** with tables like `students`, `teachers`, `courses`, etc.
-
-**If you need to switch back:**
-
-1. Update `docker-compose.yml`:
-```yaml
-POSTGRES_DB: ${DB_NAME:-school_db}
-volumes:
-  - ./docker/db/init/01-school_data.sql:/docker-entrypoint-initdb.d/01-school_data.sql:ro
-```
-
-2. Restart Docker:
-```bash
-docker-compose down -v
-docker-compose up -d
-```
-
-**Previous sample questions:**
-- "List all students"
-- "How many students are in each grade?"
-- "Count of students by attendance status"
-
----
-
-## Credits
-
-- **React** - UI Framework
-- **Chart.js** - Visualization (via react-chartjs-2)
-- **FastAPI** - Backend API
-- **LangGraph** - Workflow orchestration (CLI)
-- **Groq** - LLM for SQL generation
-- **psycopg2** - PostgreSQL connectivity
-- **Tailwind CSS** - Styling
-- **Docker** - Containerization
 
 ---
 
@@ -364,10 +429,16 @@ curl http://localhost:8000/
 
 # Check database tables
 docker exec -it nl2sql-db psql -U postgres -d hr_db -c "\dt"
+
+# Refresh profile cache
+curl -X POST http://localhost:8000/api/refresh-profile
+
+# View profile metadata
+curl http://localhost:8000/api/profile | jq
 ```
 
 ---
 
 ## License
- 
+
 Private Project
