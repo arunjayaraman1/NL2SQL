@@ -11,6 +11,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/db/init/02-hr_schema.sql:/docker-entrypoint-initdb.d/02-hr_schema.sql:ro
+      - ./docker/db/init/03-query_logs.sql:/docker-entrypoint-initdb.d/03-query_logs.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-hr_db}"]
       interval: 5s
@@ -27,7 +28,7 @@ services:
     environment:
       DB_HOST: db
       DB_PORT: 5432
-      CORS_ALLOW_ORIGINS: http://localhost:3000
+      CORS_ALLOW_ORIGINS: http://localhost:3001,http://localhost:3000
     depends_on:
       db:
         condition: service_healthy
@@ -40,10 +41,9 @@ services:
       dockerfile: frontend/Dockerfile
     container_name: nl2sql-frontend
     depends_on:
-      backend:
-        condition: service_started
+      - backend
     ports:
-      - "3000:80"
+      - "3001:80"
 
 volumes:
   pgdata:

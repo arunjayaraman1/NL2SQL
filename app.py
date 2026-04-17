@@ -19,8 +19,14 @@ from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
 from langgraph.graph import END, StateGraph
 
-from sql_prompt import build_sql_generation_prompt, build_profiled_schema_prompt
+from sql_prompt import (
+    build_sql_generation_prompt,
+    build_profiled_schema_prompt,
+    build_two_pass_prompt,
+)
 from profiler import profile_database, ProfileCache
+from validator import validate_sql
+from schema_linker import link_schema
 
 # Load environment variables from .env file
 load_dotenv()
@@ -233,7 +239,31 @@ def generate_sql(state: GraphState) -> GraphState:
         prompt = build_sql_generation_prompt(state["schema"], state["question"])
 
     response = llm.invoke(prompt)
-    state["sql_query"] = response.content.strip()
+    initial_sql = response.content.strip()
+
+    if state.get("profile_cache"):
+        print("[Schema Linking] Pass 1: Initial SQL generated")
+        filtered_schema, used_tables = link_schema(
+            initial_sql, state["profile_cache"], state.get("summary_cache")
+        )
+        print(f"[Schema Linking] Used tables: {used_tables}")
+
+        refined_prompt = build_two_pass_prompt(
+            initial_sql, filtered_schema, state["question"]
+        )
+        response = llm.invoke(refined_prompt)
+        sql = response.content.strip()
+        print("[Schema Linking] Pass 2: SQL refined")
+    else:
+        sql = initial_sql
+
+    validation_result = validate_sql(sql, state["question"])
+    if validation_result.fixes_applied:
+        print(f"[Validator] Fixes applied: {validation_result.fixes_applied}")
+    if validation_result.issues:
+        print(f"[Validator] Issues found: {validation_result.issues}")
+
+    state["sql_query"] = validation_result.sql
 
     return state
 

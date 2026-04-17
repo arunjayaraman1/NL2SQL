@@ -1,29 +1,45 @@
-# NL2SQL - Natural Language to SQL Converter (HR Database)
+# NL2SQL - Natural Language to SQL Converter
 
-A full-stack application that converts natural language questions into SQL queries with interactive visualizations. Uses React, FastAPI, PostgreSQL (HR Database), and NVIDIA LLM.
+A full-stack application that converts natural language questions into SQL queries. Uses **React 18** (Vite), **FastAPI**, **PostgreSQL** (HR Database), and **OpenRouter LLM**.
 
 ---
 
 ## Features
 
+### Core Features
 - **Natural Language to SQL**: Ask questions in plain English, get SQL results
-- **Database Profiling Layer**: Smart metadata extraction (null counts, distinct values, samples, min/max, FK detection) cached for performance
-- **Conversation UI**: Multi-turn chat interface with sticky input
-- **Interactive Charts**: Bar, Line, and Pie charts using Chart.js
-- **Natural Language Summary**: Aggregated insights from query results
+- **Clean Chat UI**: AI chatbot-style interface with typing indicators
+- **SQL Display**: Shows generated SQL with syntax highlighting
+- **Results Table**: Displays query results with all rows visible
+
+### Enhanced NL2SQL Features
+- **Schema Linking**: Two-pass SQL generation (extract → filter → refine)
+- **SQL Validation**: Auto-detects missing clauses (ORDER BY, LIMIT, GROUP BY)
+- **Literal Matching**: Maps user terms to database values (e.g., "Sales" → departments.name)
+- **Column Summarization**: LLM-generated semantic descriptions for columns
+- **Intent Hints**: Dynamically adds hints based on query patterns
+- **Query Logging**: Tracks all queries with execution metadata and analytics
+
+### Performance & Caching
+- **Database Profiling**: Cached metadata (null counts, FK/PK detection, stats)
+- **Column Summaries**: Cached semantic descriptions (24-hour TTL)
+- **Literal Index**: Pre-indexed values for fast term matching
 - **Retry Loop**: Automatic SQL error recovery (up to 3 attempts)
-- **Error Handling**: Clear error messages for invalid queries
+
+### Deployment
 - **Docker Ready**: Full stack deployment with Docker Compose
+- **React Frontend**: Vite build with Tailwind CSS
+- **FastAPI Backend**: Async API with caching
 
 ---
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Node.js 18+
 - PostgreSQL (local or Docker)
-- Docker & Docker Compose (optional)
-- NVIDIA API Key
+- Docker & Docker Compose
+- OpenRouter API Key (https://openrouter.ai/keys)
 
 ---
 
@@ -31,47 +47,35 @@ A full-stack application that converts natural language questions into SQL queri
 
 ```
 NL2SQL/
-├── app.py                     # CLI pipeline with LangGraph
-├── sql_prompt.py              # Shared NL→SQL prompt builder
-├── profiler.py                # Database profiling module
-├── profile_cache.json         # Cached profile data (auto-generated, gitignored)
-├── hr_schema.sql              # HR Database schema (17 tables)
-├── hr_examples.py              # Few-shot examples (5 examples)
+├── sql_prompt.py              # NL→SQL prompt builder with hints
+├── profiler.py                # Database profiling with caching
+├── column_summarizer.py      # LLM column summarization
+├── schema_linker.py           # Two-pass schema linking
+├── literal_matcher.py         # Literal value matching
+├── validator.py               # SQL validation layer
+├── query_logger.py            # Query logging and analytics
+├── hr_examples.py             # Few-shot examples (5)
 ├── backend/
 │   ├── main.py                # FastAPI server
 │   └── requirements.txt       # Python dependencies
-├── frontend/
+├── frontend/                  # React 18 + Vite
 │   ├── src/
-│   │   ├── App.jsx            # Main React component
-│   │   ├── components/        # UI components
-│   │   └── index.css           # Tailwind styles
-│   └── package.json            # Node dependencies
-├── docker-compose.yml          # Docker full stack
-├── docker/
-│   └── db/init/
-│       └── 02-hr_schema.sql   # HR schema for Docker
-└── .env.example                # Environment template
+│   │   ├── App.jsx           # Main app component
+│   │   ├── main.jsx          # Entry point
+│   │   ├── index.css          # Tailwind styles
+│   │   └── components/
+│   │       └── ChatMessage.jsx # Chat message component
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── index.html
+│   └── nginx.conf
+├── docker-compose.yml         # Docker full stack
+└── .env                      # Environment variables
 ```
 
 ---
 
 ## Installation
-
-### Backend Setup
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### Frontend Setup
-
-```bash
-cd frontend
-npm install
-```
 
 ### Environment Configuration
 
@@ -82,140 +86,119 @@ cp .env.example .env
 Edit `.env` with your credentials:
 
 ```env
+# Database Configuration
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=hr_db
 DB_USER=postgres
 DB_PASSWORD=your_password
-NVIDIA_API_KEY=your_nvidia_api_key
-NVIDIA_MODEL=google/gemma-2-2b-it
-NVIDIA_TEMPERATURE=0.2
-NVIDIA_TOP_P=0.7
-NVIDIA_MAX_TOKENS=1024
+
+# OpenRouter LLM Configuration
+OPENAI_API_KEY=your_openrouter_api_key
+LLM_MODEL=meta-llama/llama-3.3-70b-instruct
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=1024
+
+# Cache settings
 PROFILE_CACHE_TTL=3600
+COLUMN_CACHE_TTL=86400
+LITERAL_CACHE_TTL=86400
 ```
 
----
-
-## Database Setup (HR Database)
-
-### Option 1: Local PostgreSQL
-
-```bash
-# Create HR database
-createdb hr_db -U postgres
-
-# Load HR schema
-psql -U postgres -d hr_db -f ../hr_schema.sql
-```
-
-### Option 2: Docker (Recommended)
+### Docker Setup (Recommended)
 
 ```bash
 # Build and start all services
-docker-compose up -d
-
-# Verify container is running
-docker ps
-
-# Verify HR tables exist
-docker exec -it nl2sql-db psql -U postgres -d hr_db -c "\dt"
-```
-
-Expected output: 17 tables including `employees`, `departments`, `jobs`, `leave_requests`, etc.
-
----
-
-## Running the Application
-
-### Without Docker
-
-**Terminal 1 - Backend (Port 8000)**
-
-```bash
-cd backend
-python main.py
-# or: uvicorn main:app --reload --port 8000
-```
-
-**Terminal 2 - Frontend (Port 3000)**
-
-```bash
-cd frontend
-npm run dev
-```
-
-### With Docker
-
-```bash
 docker-compose up --build
+
+# Verify containers
+docker ps
 ```
 
 Services:
-- Frontend: http://localhost:3000
+- Frontend: http://localhost:3001
 - Backend API: http://localhost:8000
 - PostgreSQL: localhost:5432
 
----
+### Local Development
 
-## Access the Application
+**Backend:**
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
-Open your browser to: **http://localhost:3000**
-
----
-
-## Sample Questions to Try
-
-| Question | Expected Result |
-|----------|-----------------|
-| List all employees | Table with 25 employees |
-| How many employees in each department | Bar Chart |
-| What is the average salary by department | Bar Chart |
-| Show leave balances | Table with vacation/leave data |
-| Show top 5 highest paid employees | Bar Chart |
-| Employees hired after January 2023 | Filtered table |
-| Count employees by status | Bar Chart |
-| List employees with no phone number | Filtered table |
+**Frontend:**
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
 ---
 
 ## API Endpoints
 
-### Query Endpoint
+### Query Endpoints
 
 ```bash
+# Main query endpoint
 POST /api/query
 {
   "question": "How many employees in each department?",
   "db_type": "hr",
-  "use_retry": true
+  "use_retry": true,
+  "use_schema_linking": false
 }
 ```
 
-### Profile Endpoints
+### Cache Endpoints
 
 ```bash
-# Get cached profile metadata
-GET /api/profile
-
-# Force refresh profile cache
+# Get/refresh profile cache
+GET  /api/profile
 POST /api/refresh-profile
 
+# Get/refresh column summaries
+GET  /api/column-summaries
+POST /api/refresh-summaries
+
+# Get/refresh literal index
+GET  /api/literals
+POST /api/refresh-literals
+
+# Match terms in question to database values
+POST /api/match-literals
+{"question": "Show employees in Sales"}
+```
+
+### Other Endpoints
+
+```bash
 # List available databases
 GET /api/databases
 ```
 
-### CLI Options
+### Query Logs Endpoints
 
 ```bash
-# Query with cached profile
-python app.py "How many employees in each department?"
+# Get recent query logs
+GET /api/logs
+GET /api/logs?limit=20&offset=0&success=true&db_type=hr
 
-# Refresh profile cache
-python app.py --refresh-profile
+# Get specific log by ID
+GET /api/logs/{log_id}
 
-# Refresh cache and exit
-python app.py --profile-only
+# Get query statistics
+GET /api/logs/stats
+GET /api/logs/stats?days=30&db_type=hr
+
+# Clear old logs
+DELETE /api/logs/clear?days=30
 ```
 
 ---
@@ -223,174 +206,165 @@ python app.py --profile-only
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     User Interface                                  │
-│                   (React + Chart.js)                                 │
-│                      Port 3000                                      │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼ POST /api/query
-┌─────────────────────────────────────────────────────────────────────┐
-│                        FastAPI Backend                              │
-│                     (backend/main.py)                               │
-│                         Port 8000                                   │
-├─────────────────────────────────────────────────────────────────────┤
-│  1. Load Profile Cache    → Cached metadata from profiler.py        │
-│  2. Filter by db_type    → Only relevant tables                     │
-│  3. Format Schema        → Enriched schema with stats              │
-│  4. NVIDIA LLM           → Generate SQL with few-shots             │
-│  5. execute_sql()        → Run against PostgreSQL                   │
-│  6. generate_summary()   → Create NL insights                      │
-│  7. Retry Loop           → Fix errors (max 3x)                      │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      PostgreSQL Database                            │
-│                         (hr_db)                                    │
-│                         Port 5432                                  │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    User Interface (React 18)                      │
+│                    http://localhost:3001                        │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ nginx proxy
+┌─────────────────────────────────────────────────────────────────┐
+│                       FastAPI Backend                            │
+│                      (backend/main.py)                          │
+│                         Port 8000                                │
+├─────────────────────────────────────────────────────────────────┤
+│  Caches (loaded on startup):                                     │
+│  ├── Profile Cache (1h)    → stats, FK/PK, null counts        │
+│  ├── Column Summaries (24h) → LLM semantic descriptions        │
+│  └── Literal Index (24h)   → pre-indexed values                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Pipeline:                                                       │
+│  1. Load/refresh caches                                         │
+│  2. Match literal terms in question                            │
+│  3. Build enhanced schema (profiled + summarized)              │
+│  4. Generate SQL with LLM                                       │
+│  5. Validate SQL (auto-fix missing clauses)                     │
+│  6. Execute against PostgreSQL                                  │
+│  7. Generate summary                                            │
+│  8. Retry on error (max 3x)                                    │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      PostgreSQL (hr_db)                          │
+│                         Port 5432                                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Data Flow
+---
 
-1. User enters natural language question
-2. Backend loads cached profile metadata (or profiles fresh if needed)
-3. Schema + user question + 5 few-shot examples → sent to NVIDIA LLM
-4. LLM generates SQL query
-5. SQL executes against PostgreSQL (hr_db)
-6. Results returned with chart recommendations
-7. Frontend displays table + auto-detected chart
+## Enhanced Features Detail
+
+### 1. Schema Linking (Two-Pass)
+
+Pass 1: Generate SQL with full schema
+Pass 2: Extract used tables, filter schema, refine SQL
+
+This reduces hallucinations by focusing the LLM on only relevant tables.
+
+### 2. SQL Validation
+
+Auto-detects and fixes missing clauses:
+- Missing `ORDER BY` when user asks for "top" or "bottom"
+- Missing `LIMIT` when user asks for "top N"
+- Missing `GROUP BY` for aggregation queries
+- Missing `HAVING` when filtering aggregated results
+
+### 3. Literal Matching
+
+Pre-indexes column values for fast lookup:
+- "Sales" → matches `departments.name`
+- "John Smith" → matches `employees.first_name`, `employees.last_name`
+
+Provides hints to LLM for accurate WHERE clauses.
+
+### 4. Column Summarization
+
+LLM generates semantic descriptions for columns:
+- `[ID] Unique identifier for each employee`
+- `[Status] Employment status (active/terminated/on_leave)`
+
+Fallback rules for common column patterns.
+
+### 5. Query Logging
+
+All queries are logged with metadata for analytics and debugging:
+- Question, SQL, success/failure status
+- Execution time, row count, retry count
+- Session ID for multi-turn conversations
+- Statistics: success rate, avg execution time, top questions
 
 ---
 
-## Database Profiling Layer
+## Sample Questions
 
-The system automatically extracts smart metadata from the database:
-
-### What is Profiled
-
-| Metric | Description |
-|--------|-------------|
-| **Null counts** | Percentage of NULL values per column |
-| **Distinct values** | Number of unique values |
-| **Sample values** | Top 5 most frequent values |
-| **Min/Max** | Range for numeric and date columns |
-| **Primary Keys** | Auto-detected from schema |
-| **Foreign Keys** | Auto-detected relationships |
-
-### Schema Format
-
-The profiled schema includes rich metadata:
-
-```sql
-Table: employees (25 rows, 12 columns)
-  - id: integer | non-null | 25 unique | PRIMARY KEY | sample: [1, 2, 3, 4, 5]
-  - first_name: varchar | non-null | 25 unique | avg_len=5.2 | sample: ["John", "Jane", "Mike"]
-  - department_id: integer | nullable (5% null) | 5 unique | FK→departments.id | sample: [1, 2, 3, 4, 5]
-  - hire_date: date | non-null | 25 unique | range: [2020-01-15, 2024-06-30]
-  - salary: numeric | nullable (8% null) | 20 unique | range: [30000, 150000]
-```
-
-### Caching
-
-| Setting | Default | Environment Variable |
-|---------|---------|---------------------|
-| Cache TTL | 1 hour | `PROFILE_CACHE_TTL` |
-| Cache file | `profile_cache.json` | `PROFILE_CACHE_FILE` |
-
-Force refresh:
-- API: `POST /api/refresh-profile`
-- CLI: `python app.py --refresh-profile`
-
----
-
-## Graph Auto-Detection
-
-Chart.js automatically selects visualization based on result structure:
-
-| Pattern | Graph Type |
-|---------|------------|
-| Date column + numeric values | Line Chart |
-| Multiple numeric columns | Grouped Bar Chart |
-| Single category + numeric (any size) | Bar Chart |
-| Default | Bar Chart |
-
----
-
-## Features Detail
-
-### Conversation UI
-- Messages accumulate (not replaced)
-- Each query has numbered badge (1, 2, 3...)
-- Message-specific graph toggle
-- "New Question" button scrolls to input
-- Clear Chat button to reset
-
-### Natural Language Summary
-- Aggregated statistics (total, average, min, max)
-- Top item identification
-- Contextual insights per query
-
-### Database Profiling
-- Automatic metadata extraction on startup
-- Cached for performance (1 hour default)
-- Includes null counts, distinct values, samples, min/max
-- Auto-detects primary keys and foreign keys
-
-### Retry Loop
-- Automatically retries on SQL errors
-- Analyzes error type (retryable vs non-retryable)
-- Max 3 attempts per query
-- Non-retryable: permission denied, connection failed
-
-### Error Handling
-
-| Error Type | Behavior |
-|------------|----------|
-| Table not found | Retry with LLM fix |
-| Syntax error | Retry with fix |
-| Permission denied | Stop, show error |
-| Connection failed | Stop, show error |
+| Question | SQL Pattern |
+|----------|-------------|
+| How many employees in each department? | GROUP BY + COUNT |
+| Show top 5 highest paid employees | ORDER BY + LIMIT |
+| List employees in Sales department | JOIN + WHERE |
+| Average salary by job title | GROUP BY + AVG |
+| Employees hired after January 2024 | WHERE + date |
+| Count by status | GROUP BY + COUNT |
 
 ---
 
 ## Troubleshooting
 
-### Backend won't start
-- Check PostgreSQL is running
-- Verify `.env` credentials are correct
-- Ensure NVIDIA API key is valid
+### Backend startup delay
 
-### Frontend won't load
-- Ensure backend is running on port 8000
-- Check no other process uses port 3000
+First startup takes 3-5 minutes because:
+1. Column summarization calls LLM for each column
+2. Literal indexing scans text columns
 
-### Graph not displaying
-- Data may not be suitable for visualization
-- Try questions that return counts or aggregations
+After first run, caches are used and startup is instant.
 
-### Docker: Database not found
+### Backend not responding
 
 ```bash
-# Stop and reset volume
-docker-compose down -v
+# Check backend logs
+docker-compose logs backend
 
-# Restart
+# Wait for "Application startup complete" message
+# Then test API
+curl http://localhost:8000/api/databases
+```
+
+### 502 Bad Gateway (nginx)
+
+Backend is still starting. Wait for startup to complete.
+
+### Refresh caches
+
+```bash
+# Refresh all caches
+curl -X POST http://localhost:8000/api/refresh-profile
+curl -X POST http://localhost:8000/api/refresh-summaries
+curl -X POST http://localhost:8000/api/refresh-literals
+```
+
+### Docker database reset
+
+```bash
+docker-compose down -v
 docker-compose up -d
 ```
 
-### Docker: Permission denied
-- Ensure `.env` has correct `DB_USER` and `DB_PASSWORD`
+---
 
-### Refresh profile cache
+## Quick Reference Commands
 
 ```bash
-# Via API
-curl -X POST http://localhost:8000/api/refresh-profile
+# Start with Docker
+docker-compose up --build
 
-# Via CLI
-docker exec -it nl2sql-backend python app.py --refresh-profile
+# Check API health
+curl http://localhost:8000/api/databases
+
+# Test query
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "How many employees?"}'
+
+# Check profile
+curl http://localhost:8000/api/profile | jq
+
+# View literal matches
+curl -X POST http://localhost:8000/api/match-literals \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Show Sales employees"}'
+
+# Docker logs
+docker-compose logs -f backend
 ```
 
 ---
@@ -399,43 +373,16 @@ docker exec -it nl2sql-backend python app.py --refresh-profile
 
 | File | Description |
 |------|-------------|
-| `sql_prompt.py` | NL→SQL prompt: few-shots (5), dialect hints, profiled schema support |
-| `profiler.py` | Database profiling with caching, FK detection, stats extraction |
-| `hr_schema.sql` | HR database schema (17 tables) |
-| `hr_examples.py` | Few-shot examples (5 diverse patterns) |
-| `backend/main.py` | FastAPI server with NL2SQL pipeline, profile endpoints |
-| `frontend/src/App.jsx` | React UI with Chart.js |
-| `app.py` | CLI alternative with LangGraph |
-| `.env` | Database and API credentials |
-
----
-
-## Quick Reference Commands
-
-```bash
-# Start locally (need PostgreSQL running)
-cd backend && python main.py  # Terminal 1
-cd frontend && npm run dev    # Terminal 2
-
-# Start with Docker
-docker-compose up --build
-
-# Reset Docker database
-docker-compose down -v
-docker-compose up -d
-
-# Verify API
-curl http://localhost:8000/
-
-# Check database tables
-docker exec -it nl2sql-db psql -U postgres -d hr_db -c "\dt"
-
-# Refresh profile cache
-curl -X POST http://localhost:8000/api/refresh-profile
-
-# View profile metadata
-curl http://localhost:8000/api/profile | jq
-```
+| `sql_prompt.py` | Prompt builder with intent hints, dialect hints |
+| `profiler.py` | Database profiling with caching |
+| `column_summarizer.py` | LLM column summarization with fallbacks |
+| `schema_linker.py` | Two-pass schema linking |
+| `literal_matcher.py` | Literal value indexing and matching |
+| `validator.py` | SQL validation with auto-fix |
+| `query_logger.py` | Query logging and analytics |
+| `backend/main.py` | FastAPI server with all endpoints |
+| `frontend/src/App.jsx` | React main app component |
+| `frontend/src/components/ChatMessage.jsx` | Chat message component |
 
 ---
 

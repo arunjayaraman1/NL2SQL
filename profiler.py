@@ -261,14 +261,23 @@ def profile_column(
         null_count = total_count - len(non_null_values)
         null_percentage = (null_count / total_count * 100) if total_count > 0 else 0
 
-        distinct_values = set(non_null_values)
+        def make_hashable(v):
+            if isinstance(v, (list, dict)):
+                import json
+
+                return json.dumps(v, sort_keys=True)
+            return v
+
+        hashable_values = [make_hashable(v) for v in non_null_values]
+        distinct_values = set(hashable_values)
         distinct_count = len(distinct_values)
 
         samples = []
         if distinct_count > 0:
             value_counts: dict = {}
             for v in non_null_values:
-                value_counts[v] = value_counts.get(v, 0) + 1
+                hv = make_hashable(v)
+                value_counts[hv] = value_counts.get(hv, 0) + 1
             sorted_values = sorted(
                 value_counts.items(), key=lambda x: x[1], reverse=True
             )

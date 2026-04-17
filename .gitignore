@@ -12,3 +12,5 @@ __pycache__/
 
 # Database profiling cache
 profile_cache.json
+column_summary_cache.json
+literal_cache.json
