@@ -1,7 +1,7 @@
 import os
 import sys
 import json
-import subprocess
+import time
 from pathlib import Path
 from typing import TypedDict, Optional
 
@@ -13,30 +13,36 @@ import psycopg2
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_openai import ChatOpenAI
 
 from sql_prompt import build_sql_generation_prompt, build_profiled_schema_prompt
 from profiler import profile_database, load_profile_cache, ProfileCache
 
+SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast", "pg_temp", "pg_sys"}
+
 load_dotenv()
 
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-2-2b-it")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_TEMPERATURE = float(os.getenv("NVIDIA_TEMPERATURE", "0.2"))
-NVIDIA_TOP_P = float(os.getenv("NVIDIA_TOP_P", "0.7"))
-NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "1024"))
-DEFAULT_CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
+OPENROUTER_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+]
 
 _profile_cache: Optional[ProfileCache] = None
 
 
-def build_llm_client() -> ChatNVIDIA:
-    return ChatNVIDIA(
-        model=NVIDIA_MODEL,
-        api_key=NVIDIA_API_KEY,
-        temperature=NVIDIA_TEMPERATURE,
-        top_p=NVIDIA_TOP_P,
-        max_tokens=NVIDIA_MAX_TOKENS,
+def build_llm_client() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=LLM_MODEL,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
     )
 
 
@@ -66,7 +72,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Load profile cache on application startup."""
+    """Load caches on application startup."""
     global _profile_cache
     try:
         conn = get_db_connection()
@@ -74,7 +80,7 @@ async def startup_event():
         conn.close()
         print(f"Profile cache loaded: {len(_profile_cache.tables)} tables")
     except Exception as e:
-        print(f"Warning: Could not load profile cache: {e}")
+        print(f"Warning: Could not load caches: {e}")
 
 
 @app.on_event("shutdown")
@@ -94,112 +100,115 @@ class RetryState(TypedDict):
 
 
 def get_db_connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
     )
+    cursor = conn.cursor()
+    cursor.execute("SET search_path TO hr, public;")
+    cursor.close()
+    return conn
 
 
-AVAILABLE_DATABASES = {
-    "hr": {
-        "name": "HR Database",
-        "tables": [
-            "departments",
-            "jobs",
-            "employees",
-            "employees_history",
-            "salaries",
-            "bonuses",
-            "leave_requests",
-            "leave_balances",
-            "attendance_logs",
-            "performance_reviews",
-            "training_enrollments",
-            "certifications",
-            "promotions",
-            "terminations",
-            "approvals",
-            "emergency_contacts",
-            "audit_logs",
-        ],
-    },
-    "school": {
-        "name": "School Database",
-        "tables": [
-            "students",
-            "teachers",
-            "courses",
-            "classes",
-            "enrollments",
-            "attendance",
-        ],
-    },
-}
+def get_available_databases(force_refresh: bool = False):
+    """Return list of available databases (schemas) - auto-discovered from PostgreSQL."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.schema_name, COALESCE(t.table_count, 0)
+            FROM information_schema.schemata s
+            LEFT JOIN (
+                SELECT table_schema, COUNT(*) AS table_count
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                GROUP BY table_schema
+            ) t ON t.table_schema = s.schema_name
+            WHERE s.schema_name NOT IN %s
+              AND s.schema_name NOT LIKE 'pg_temp_%%'
+              AND s.schema_name NOT LIKE 'pg_toast_%%'
+            ORDER BY s.schema_name
+            """,
+            (tuple(SYSTEM_SCHEMAS),),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
-
-def get_available_databases():
-    """Return list of available databases/table groups."""
-    return [
-        {
-            "id": "hr",
-            "name": "HR Database",
-            "table_count": len(AVAILABLE_DATABASES["hr"]["tables"]),
-        },
-        {
-            "id": "school",
-            "name": "School Database",
-            "table_count": len(AVAILABLE_DATABASES["school"]["tables"]),
-        },
-    ]
+        return [
+            {
+                "id": name,
+                "name": name.replace("_", " ").title(),
+                "table_count": int(count),
+            }
+            for name, count in rows
+        ]
+    except Exception as e:
+        print(f"Error discovering databases: {e}")
+        return [{"id": "public", "name": "Public", "table_count": 0}]
 
 
 def get_db_tables(db_type=None):
-    """Get list of tables in the database."""
+    """Get list of tables in the database (schema)."""
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    query = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
-    cursor.execute(query)
+    if db_type:
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            """,
+            (db_type,),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN %s
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_schema, table_name
+            """,
+            (tuple(SYSTEM_SCHEMAS),),
+        )
     tables = [row[0] for row in cursor.fetchall()]
-
     cursor.close()
     conn.close()
-
-    if db_type and db_type in AVAILABLE_DATABASES:
-        allowed_tables = AVAILABLE_DATABASES[db_type]["tables"]
-        tables = [t for t in tables if t in allowed_tables]
-
     return tables
 
 
 def fetch_schema(db_type=None):
-    """Fetch database schema, optionally filtered by database type."""
+    """Fetch database schema, optionally filtered by schema (db_type)."""
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    schema_name = db_type if db_type else "public"
 
     query = """
         SELECT table_name, column_name, data_type 
         FROM information_schema.columns 
-        WHERE table_schema = 'public' 
+        WHERE table_schema = %s
         ORDER BY table_name, ordinal_position
     """
 
-    cursor.execute(query)
+    cursor.execute(query, (schema_name,))
     columns = cursor.fetchall()
 
     schema_lines = []
     current_table = None
 
-    allowed_tables = None
-    if db_type and db_type in AVAILABLE_DATABASES:
-        allowed_tables = set(AVAILABLE_DATABASES[db_type]["tables"])
-
     for table, column, dtype in columns:
-        if allowed_tables and table not in allowed_tables:
-            continue
+        if table != current_table:
+            schema_lines.append(f"\nTable: {table}")
+            current_table = table
+        schema_lines.append(f"  - {column} ({dtype})")
         if table != current_table:
             schema_lines.append(f"\nTable: {table}")
             current_table = table
@@ -597,9 +606,9 @@ def refresh_profile():
 
 
 @app.get("/api/databases")
-def get_databases():
-    """Return available databases/table groups."""
-    return {"databases": get_available_databases()}
+def get_databases(refresh: bool = False):
+    """Return available databases (schemas) - auto-discovered from PostgreSQL."""
+    return {"databases": get_available_databases(force_refresh=refresh)}
 
 
 @app.post("/api/query")
@@ -607,7 +616,7 @@ def process_query(request: dict):
     global _profile_cache
 
     question = request.get("question", "")
-    db_type = request.get("db_type", "hr")
+    db_type = request.get("db_type", "")
     use_retry = request.get("use_retry", True)
 
     if _profile_cache is None:
@@ -619,8 +628,8 @@ def process_query(request: dict):
             return {"error": f"Failed to load profile cache: {e}"}
 
     filtered_tables = None
-    if db_type and db_type in AVAILABLE_DATABASES:
-        filtered_tables = AVAILABLE_DATABASES[db_type]["tables"]
+    if db_type:
+        filtered_tables = get_db_tables(db_type)
 
     from profiler import format_profiled_schema
 
