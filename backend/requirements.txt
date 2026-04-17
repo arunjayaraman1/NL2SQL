@@ -2,5 +2,5 @@ fastapi
 uvicorn
 python-dotenv
 psycopg2-binary
-langchain-nvidia-ai-endpoints
+langchain-openai
 langgraph

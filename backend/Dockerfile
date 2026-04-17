@@ -12,6 +12,11 @@ COPY backend ./backend
 COPY sql_prompt.py ./sql_prompt.py
 COPY hr_examples.py ./hr_examples.py
 COPY profiler.py ./profiler.py
+COPY validator.py ./validator.py
+COPY column_summarizer.py ./column_summarizer.py
+COPY schema_linker.py ./schema_linker.py
+COPY literal_matcher.py ./literal_matcher.py
+COPY query_logger.py ./query_logger.py
 
 EXPOSE 8000
 

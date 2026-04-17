@@ -13,30 +13,50 @@ import psycopg2
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_openai import ChatOpenAI
 
-from sql_prompt import build_sql_generation_prompt, build_profiled_schema_prompt
+from sql_prompt import (
+    build_sql_generation_prompt,
+    build_profiled_schema_prompt,
+    build_two_pass_prompt,
+)
 from profiler import profile_database, load_profile_cache, ProfileCache
+from validator import validate_sql
+from column_summarizer import (
+    summarize_database_columns,
+    load_summary_cache,
+    ColumnSummaryCache,
+)
+from schema_linker import link_schema
+from literal_matcher import (
+    index_database,
+    load_literal_cache,
+    match_terms_in_question,
+    LiteralCache,
+)
+from query_logger import QueryLogger, QueryLogEntry
 
 load_dotenv()
 
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "google/gemma-2-2b-it")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_TEMPERATURE = float(os.getenv("NVIDIA_TEMPERATURE", "0.2"))
-NVIDIA_TOP_P = float(os.getenv("NVIDIA_TOP_P", "0.7"))
-NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "1024"))
-DEFAULT_CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+DEFAULT_CORS_ORIGINS = ["http://localhost:3001", "http://localhost:3000"]
 
 _profile_cache: Optional[ProfileCache] = None
+_summary_cache: Optional[ColumnSummaryCache] = None
+_literal_cache: Optional[LiteralCache] = None
+_query_logger: Optional[QueryLogger] = None
 
 
-def build_llm_client() -> ChatNVIDIA:
-    return ChatNVIDIA(
-        model=NVIDIA_MODEL,
-        api_key=NVIDIA_API_KEY,
-        temperature=NVIDIA_TEMPERATURE,
-        top_p=NVIDIA_TOP_P,
-        max_tokens=NVIDIA_MAX_TOKENS,
+def build_llm_client() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
+        max_tokens=int(os.getenv("LLM_MAX_TOKENS", "1024")),
     )
 
 
@@ -66,15 +86,33 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Load profile cache on application startup."""
-    global _profile_cache
+    """Load profile, column summary, and literal caches on application startup."""
+    global _profile_cache, _summary_cache, _literal_cache, _query_logger
     try:
         conn = get_db_connection()
         _profile_cache = profile_database(conn)
-        conn.close()
         print(f"Profile cache loaded: {len(_profile_cache.tables)} tables")
+
+        _summary_cache = summarize_database_columns(
+            {name: table.to_dict() for name, table in _profile_cache.tables.items()},
+            _profile_cache.database_hash,
+        )
+        print(f"Column summaries loaded: {len(_summary_cache.summaries)} tables")
+
+        _literal_cache = index_database(conn)
+        total_values = sum(
+            len(col.values)
+            for table_cols in _literal_cache.literals.values()
+            for col in table_cols.values()
+        )
+        print(f"Literal cache loaded: {total_values} values indexed")
+
+        _query_logger = QueryLogger(conn)
+        print("Query logger initialized")
+
+        conn.close()
     except Exception as e:
-        print(f"Warning: Could not load profile cache: {e}")
+        print(f"Warning: Could not load caches: {e}")
 
 
 @app.on_event("shutdown")
@@ -267,7 +305,87 @@ def generate_sql(schema, question):
         if sql.startswith("sql"):
             sql = sql[3:].strip()
 
-    return sql
+    # Validate and auto-fix SQL
+    validation_result = validate_sql(sql, question)
+    if validation_result.fixes_applied:
+        print(f"[Validator] Fixes applied: {validation_result.fixes_applied}")
+    if validation_result.issues:
+        print(f"[Validator] Issues found: {validation_result.issues}")
+
+    return validation_result.sql
+
+
+def generate_sql_two_pass(
+    schema: str,
+    question: str,
+    profile_cache: ProfileCache,
+    summary_cache: ColumnSummaryCache = None,
+    literal_cache: LiteralCache = None,
+):
+    """
+    Generate SQL using two-pass schema linking.
+
+    Pass 1: Generate SQL with full schema
+    Pass 2: Extract used tables, build filtered schema, refine SQL
+
+    Args:
+        schema: Full schema string
+        question: User question
+        profile_cache: Profile cache for schema linking
+        summary_cache: Optional column summaries
+        literal_cache: Optional literal cache for value matching
+
+    Returns:
+        Refined SQL query
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    llm = build_llm_client()
+
+    logger.info("[Schema Linking] Pass 1: Generating initial SQL")
+    prompt = build_sql_generation_prompt(schema, question, literal_cache=literal_cache)
+    response = llm.invoke(prompt)
+    initial_sql = response.content.strip()
+
+    # Remove markdown code blocks
+    if initial_sql.startswith("```"):
+        initial_sql = initial_sql.split("```")[1]
+        initial_sql = initial_sql.strip()
+        if initial_sql.startswith("sql"):
+            initial_sql = initial_sql[3:].strip()
+
+    logger.info(f"[Schema Linking] Initial SQL: {initial_sql[:100]}...")
+
+    logger.info("[Schema Linking] Pass 2: Extracting schema and refining")
+    filtered_schema, used_tables = link_schema(
+        initial_sql, profile_cache, summary_cache
+    )
+
+    logger.info(f"[Schema Linking] Used tables: {used_tables}")
+
+    refined_prompt = build_two_pass_prompt(initial_sql, filtered_schema, question)
+    response = llm.invoke(refined_prompt)
+    refined_sql = response.content.strip()
+
+    # Remove markdown code blocks
+    if refined_sql.startswith("```"):
+        refined_sql = refined_sql.split("```")[1]
+        refined_sql = refined_sql.strip()
+        if refined_sql.startswith("sql"):
+            refined_sql = refined_sql[3:].strip()
+
+    logger.info(f"[Schema Linking] Refined SQL: {refined_sql[:100]}...")
+
+    # Validate the refined SQL
+    validation_result = validate_sql(refined_sql, question)
+    if validation_result.fixes_applied:
+        print(f"[Validator] Fixes applied: {validation_result.fixes_applied}")
+    if validation_result.issues:
+        print(f"[Validator] Issues found: {validation_result.issues}")
+
+    return validation_result.sql
 
 
 def fix_sql_with_error(sql: str, error_msg: str, schema: str) -> str:
@@ -596,19 +714,282 @@ def refresh_profile():
         return {"error": str(e)}
 
 
+@app.get("/api/column-summaries")
+def get_column_summaries():
+    """Return current column summaries."""
+    global _summary_cache
+    if _summary_cache is None:
+        return {"error": "Column summaries not loaded"}
+
+    return {
+        "generated_at": _summary_cache.generated_at,
+        "expires_in_seconds": _summary_cache.expires_in_seconds,
+        "tables": {
+            table: {
+                column: {
+                    "short_label": summary.short_label,
+                    "description": summary.description,
+                    "inferred_type": summary.inferred_type,
+                    "confidence": summary.confidence,
+                }
+                for column, summary in columns.items()
+            }
+            for table, columns in _summary_cache.summaries.items()
+        },
+    }
+
+
+@app.post("/api/refresh-summaries")
+def refresh_summaries():
+    """Force refresh the column summaries cache."""
+    global _summary_cache, _profile_cache
+    try:
+        if _profile_cache is None:
+            conn = get_db_connection()
+            _profile_cache = profile_database(conn)
+            conn.close()
+
+        _summary_cache = summarize_database_columns(
+            {name: table.to_dict() for name, table in _profile_cache.tables.items()},
+            _profile_cache.database_hash,
+            force_refresh=True,
+        )
+        return {
+            "status": "refreshed",
+            "table_count": len(_summary_cache.summaries),
+            "generated_at": _summary_cache.generated_at,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/literals")
+def get_literals():
+    """Return current literal index metadata."""
+    global _literal_cache
+    if _literal_cache is None:
+        return {"error": "Literal cache not loaded"}
+
+    total_values = sum(
+        len(col.values)
+        for table_cols in _literal_cache.literals.values()
+        for col in table_cols.values()
+    )
+
+    return {
+        "generated_at": _literal_cache.generated_at,
+        "expires_in_seconds": _literal_cache.expires_in_seconds,
+        "table_count": len(_literal_cache.literals),
+        "total_values": total_values,
+        "tables": {
+            table: list(columns.keys())
+            for table, columns in _literal_cache.literals.items()
+        },
+    }
+
+
+@app.post("/api/refresh-literals")
+def refresh_literals():
+    """Force refresh the literal cache."""
+    global _literal_cache
+    try:
+        conn = get_db_connection()
+        _literal_cache = index_database(conn, force_refresh=True)
+        conn.close()
+
+        total_values = sum(
+            len(col.values)
+            for table_cols in _literal_cache.literals.values()
+            for col in table_cols.values()
+        )
+
+        return {
+            "status": "refreshed",
+            "table_count": len(_literal_cache.literals),
+            "total_values": total_values,
+            "generated_at": _literal_cache.generated_at,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/match-literals")
+def match_literals(request: dict):
+    """Match terms in a question against indexed literals."""
+    global _literal_cache
+
+    if _literal_cache is None:
+        return {"error": "Literal cache not loaded"}
+
+    question = request.get("question", "")
+    if not question:
+        return {"error": "No question provided"}
+
+    try:
+        from literal_matcher import match_terms_in_question
+
+        matches = match_terms_in_question(question, _literal_cache)
+        return {
+            "question": question,
+            "matches": [
+                {
+                    "table": m.table,
+                    "column": m.column,
+                    "matched_value": m.matched_value,
+                    "match_type": m.match_type,
+                    "confidence": m.confidence,
+                }
+                for m in matches
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/databases")
 def get_databases():
     """Return available databases/table groups."""
     return {"databases": get_available_databases()}
 
 
+@app.get("/api/logs")
+def get_query_logs(
+    limit: int = 50,
+    offset: int = 0,
+    db_type: str = None,
+    success: bool = None,
+    session_id: str = None,
+):
+    """Return recent query logs with optional filtering."""
+    global _query_logger
+
+    if _query_logger is None:
+        return {"error": "Query logger not initialized"}
+
+    try:
+        success_filter = None
+        if success is not None:
+            success_filter = success.lower() in ("true", "1", "yes")
+
+        logs = _query_logger.get_recent_logs(
+            limit=min(limit, 100),
+            offset=offset,
+            db_type=db_type,
+            success=success_filter,
+            session_id=session_id,
+        )
+
+        return {
+            "logs": [
+                {
+                    "id": log.id,
+                    "question": log.question,
+                    "sql_query": log.sql_query,
+                    "db_type": log.db_type,
+                    "success": log.success,
+                    "error_message": log.error_message,
+                    "row_count": log.row_count,
+                    "execution_time_ms": log.execution_time_ms,
+                    "created_at": log.created_at.isoformat()
+                    if log.created_at
+                    else None,
+                    "retry_count": log.retry_count,
+                }
+                for log in logs
+            ],
+            "limit": limit,
+            "offset": offset,
+            "count": len(logs),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/logs/{log_id}")
+def get_query_log(log_id: int):
+    """Get a specific query log by ID."""
+    global _query_logger
+
+    if _query_logger is None:
+        return {"error": "Query logger not initialized"}
+
+    log = _query_logger.get_log_by_id(log_id)
+    if log is None:
+        return {"error": "Log not found"}
+
+    return {
+        "id": log.id,
+        "question": log.question,
+        "sql_query": log.sql_query,
+        "db_type": log.db_type,
+        "success": log.success,
+        "error_message": log.error_message,
+        "columns": log.columns,
+        "row_count": log.row_count,
+        "execution_time_ms": log.execution_time_ms,
+        "use_schema_linking": log.use_schema_linking,
+        "use_retry": log.use_retry,
+        "retry_count": log.retry_count,
+        "created_at": log.created_at.isoformat() if log.created_at else None,
+        "session_id": log.session_id,
+        "user_id": log.user_id,
+    }
+
+
+@app.get("/api/logs/stats")
+def get_query_stats(db_type: str = None, days: int = 7):
+    """Get query statistics for a time period."""
+    global _query_logger
+
+    if _query_logger is None:
+        return {"error": "Query logger not initialized"}
+
+    try:
+        stats = _query_logger.get_stats(db_type=db_type, days=days)
+        return stats
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/logs/clear")
+def clear_old_logs(days: int = 30):
+    """Clear query logs older than specified days."""
+    global _query_logger
+
+    if _query_logger is None:
+        return {"error": "Query logger not initialized"}
+
+    try:
+        deleted = _query_logger.clear_old_logs(days=days)
+        return {"status": "cleared", "deleted_count": deleted, "older_than_days": days}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/query")
 def process_query(request: dict):
-    global _profile_cache
+    global _profile_cache, _summary_cache, _literal_cache, _query_logger
 
     question = request.get("question", "")
     db_type = request.get("db_type", "hr")
     use_retry = request.get("use_retry", True)
+    use_schema_linking = request.get("use_schema_linking", False)
+    session_id = request.get("session_id")
+
+    import time
+
+    start_time = time.time()
+    retry_count = 0
+    log_id = None
+
+    if _query_logger:
+        log_id = _query_logger.log_query(
+            question=question,
+            db_type=db_type,
+            use_schema_linking=use_schema_linking,
+            use_retry=use_retry,
+            session_id=session_id,
+        )
 
     if _profile_cache is None:
         try:
@@ -618,34 +999,159 @@ def process_query(request: dict):
         except Exception as e:
             return {"error": f"Failed to load profile cache: {e}"}
 
+    if _summary_cache is None:
+        try:
+            _summary_cache = summarize_database_columns(
+                {
+                    name: table.to_dict()
+                    for name, table in _profile_cache.tables.items()
+                },
+                _profile_cache.database_hash,
+            )
+        except Exception as e:
+            print(f"Warning: Could not load column summaries: {e}")
+
+    if _literal_cache is None:
+        try:
+            conn = get_db_connection()
+            _literal_cache = index_database(conn)
+            conn.close()
+        except Exception as e:
+            print(f"Warning: Could not load literal cache: {e}")
+
     filtered_tables = None
     if db_type and db_type in AVAILABLE_DATABASES:
         filtered_tables = AVAILABLE_DATABASES[db_type]["tables"]
 
-    from profiler import format_profiled_schema
+    from sql_prompt import format_enhanced_schema
 
-    schema = format_profiled_schema(_profile_cache, table_names=filtered_tables)
+    schema = format_enhanced_schema(
+        _profile_cache, _summary_cache, table_names=filtered_tables
+    )
+
+    if use_schema_linking:
+        sql = generate_sql_two_pass(
+            schema, question, _profile_cache, _summary_cache, _literal_cache
+        )
+    else:
+        sql = generate_sql(schema, question)
+
+    retry_count = 0
+    current_sql = sql
+    last_error = None
 
     if use_retry:
-        result = generate_sql_with_retry(schema, question, max_iterations=3)
+        for iteration in range(3):
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(current_sql)
+                rows = cursor.fetchall()
+                cursor.close()
+                conn.close()
 
-        if "error" in result:
-            return {"sql_query": result["sql_query"], "error": result["error"]}
+                if not rows:
+                    execution_time = int((time.time() - start_time) * 1000)
+                    if _query_logger and log_id:
+                        _query_logger.update_log(
+                            log_id,
+                            sql_query=current_sql,
+                            success=True,
+                            execution_time_ms=execution_time,
+                            retry_count=retry_count,
+                        )
+                    return {
+                        "sql_query": current_sql,
+                        "columns": [],
+                        "data": [],
+                        "summary": "No results found.",
+                        "graph_hint": "none",
+                    }
 
-        return {
-            "sql_query": result["sql_query"],
-            "columns": result["columns"],
-            "data": result["data"],
-            "summary": result.get("summary", ""),
-            "graph_hint": result["graph_hint"],
-        }
+                columns = (
+                    [desc[0] for desc in cursor.description]
+                    if iteration == 0
+                    else columns
+                )
+                data = [dict(zip(columns, row)) for row in rows]
+
+                execution_time = int((time.time() - start_time) * 1000)
+                summary = generate_summary(question, columns, data)
+
+                if _query_logger and log_id:
+                    _query_logger.update_log(
+                        log_id,
+                        sql_query=current_sql,
+                        success=True,
+                        columns=columns,
+                        row_count=len(data),
+                        execution_time_ms=execution_time,
+                        retry_count=retry_count,
+                    )
+
+                return {
+                    "sql_query": current_sql,
+                    "columns": columns,
+                    "data": data,
+                    "summary": summary,
+                    "graph_hint": "auto",
+                }
+
+            except Exception as e:
+                last_error = str(e)
+                retry_count = iteration + 1
+
+                non_retryable = [
+                    "permission denied",
+                    "must be superuser",
+                    "connection refused",
+                ]
+                if (
+                    any(p in last_error.lower() for p in non_retryable)
+                    or iteration == 2
+                ):
+                    execution_time = int((time.time() - start_time) * 1000)
+                    if _query_logger and log_id:
+                        _query_logger.update_log(
+                            log_id,
+                            sql_query=current_sql,
+                            success=False,
+                            error_message=last_error,
+                            execution_time_ms=execution_time,
+                            retry_count=retry_count,
+                        )
+                    return {
+                        "sql_query": current_sql,
+                        "error": f"SQL Error: {last_error}",
+                    }
+
+                current_sql = fix_sql_with_error(current_sql, last_error, schema)
+
     else:
-        # No retry (old behavior for backward compatibility)
-        sql = generate_sql(schema, question)
         result = execute_sql_direct(sql)
 
         if "error" in result:
+            execution_time = int((time.time() - start_time) * 1000)
+            if _query_logger and log_id:
+                _query_logger.update_log(
+                    log_id,
+                    sql_query=sql,
+                    success=False,
+                    error_message=result["error"],
+                    execution_time_ms=execution_time,
+                )
             return {"sql_query": sql, "error": result["error"]}
+
+        execution_time = int((time.time() - start_time) * 1000)
+        if _query_logger and log_id:
+            _query_logger.update_log(
+                log_id,
+                sql_query=sql,
+                success=True,
+                columns=result["columns"],
+                row_count=len(result["data"]),
+                execution_time_ms=execution_time,
+            )
 
         return {
             "sql_query": sql,
