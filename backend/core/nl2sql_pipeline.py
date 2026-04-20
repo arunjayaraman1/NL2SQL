@@ -11,11 +11,13 @@ works with multi-database configuration.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 from .db_registry import get_connection
+from .graph_spec import build_fallback_graph_spec, validate_graph_spec
 from .profiler import ProfileCache, format_profiled_schema, profile_database
 from .schema_linker import link_schema
 from .sql_prompt import (
@@ -24,6 +26,9 @@ from .sql_prompt import (
     build_two_pass_prompt,
 )
 from .validator import validate_sql
+
+
+ProgressCallback = Callable[[str, str, str, dict[str, Any]], None]
 
 
 class GraphState(TypedDict, total=False):
@@ -41,11 +46,30 @@ class GraphState(TypedDict, total=False):
     data: list[dict]
     summary: str
     graph_hint: str
+    graph_spec: dict[str, Any]
 
     profile_cache: Optional[ProfileCache]
     summary_cache: Optional[Any]
     force_refresh: bool
     cache_path: Optional[str]
+    progress_callback: Optional[ProgressCallback]
+
+
+def _emit_progress(
+    state: GraphState,
+    step_id: str,
+    label: str,
+    status: str = "completed",
+    meta: Optional[dict[str, Any]] = None,
+) -> None:
+    callback = state.get("progress_callback")
+    if not callable(callback):
+        return
+    try:
+        callback(step_id, label, status, meta or {})
+    except Exception:
+        # Progress updates should never break pipeline execution.
+        pass
 
 
 def _strip_sql_fences(sql: str) -> str:
@@ -203,9 +227,81 @@ Rules:
     return summary
 
 
+def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if not match:
+        return None
+
+    candidate = match.group(0)
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def generate_graph_spec(
+    state: GraphState, question: str, columns: list[str], data: list[dict]
+) -> dict[str, Any]:
+    fallback = build_fallback_graph_spec(columns, data)
+    fallback["source"] = "heuristic"
+
+    llm_builder = state.get("llm_builder")
+    if not callable(llm_builder):
+        return fallback
+
+    prompt = f"""You pick a chart spec from SQL results.
+
+Return JSON only with this shape:
+{{
+  "chart_type": "bar|line|pie|none",
+  "x_key": "<column name>",
+  "y_keys": ["<numeric column>"]
+}}
+
+Question:
+{question}
+
+Columns:
+{columns}
+
+Result sample JSON:
+{_build_summary_payload(columns, data)}
+
+Rules:
+- Use only listed columns.
+- y_keys must be numeric columns only.
+- Use line for time-series trends, bar for categorical comparisons, pie for small part-to-whole.
+- Prefer a single metric for pie charts.
+- If data is not chartable, return chart_type "none" with empty keys.
+- Output plain JSON only.
+"""
+    try:
+        llm = llm_builder()
+        response = llm.invoke(prompt)
+        parsed = _extract_json_object(str(getattr(response, "content", "")))
+        validated = validate_graph_spec(parsed, columns, data) if parsed else None
+        if validated:
+            validated["source"] = "llm"
+            return validated
+    except Exception:
+        pass
+    return fallback
+
+
 def fetch_schema(state: GraphState) -> GraphState:
     """Node 1: fetch or build profiled schema text."""
     if state.get("profile_cache") is not None and state.get("schema"):
+        _emit_progress(state, "schema_profile_loaded", "Schema/profile loaded")
         return state
 
     db_id = state.get("db_id")
@@ -225,6 +321,7 @@ def fetch_schema(state: GraphState) -> GraphState:
 
     state["profile_cache"] = profile_cache
     state["schema"] = format_profiled_schema(profile_cache)
+    _emit_progress(state, "schema_profile_loaded", "Schema/profile loaded")
     return state
 
 
@@ -242,18 +339,22 @@ def generate_sql(state: GraphState) -> GraphState:
         prompt = build_sql_generation_prompt(state.get("schema", ""), question)
 
     initial_sql = _llm_invoke(state, prompt)
+    _emit_progress(state, "sql_drafted", "SQL drafted")
 
     if state.get("profile_cache"):
         filtered_schema, _ = link_schema(
             initial_sql, state["profile_cache"], state.get("summary_cache")
         )
+        _emit_progress(state, "schema_linking_complete", "Schema linking complete")
         refined_prompt = build_two_pass_prompt(initial_sql, filtered_schema, question)
         sql = _llm_invoke(state, refined_prompt)
     else:
+        _emit_progress(state, "schema_linking_complete", "Schema linking complete")
         sql = initial_sql
 
     validation_result = validate_sql(sql, question)
     state["sql_query"] = validation_result.sql
+    _emit_progress(state, "sql_validated", "SQL validated")
     return state
 
 
@@ -279,6 +380,14 @@ def execute_sql(state: GraphState) -> GraphState:
             state["data"] = []
             state["summary"] = "I couldn't find any matching records for that question."
             state["graph_hint"] = "none"
+            state["graph_spec"] = {"chart_type": "none", "x_key": "", "y_keys": []}
+            _emit_progress(
+                state,
+                "query_executed",
+                "Query executed",
+                status="failed",
+                meta={"reason": "Only SELECT queries are allowed"},
+            )
             return state
 
         try:
@@ -299,12 +408,21 @@ def execute_sql(state: GraphState) -> GraphState:
                 state["data"] = []
                 state["summary"] = "I couldn't find any matching records for that question."
                 state["graph_hint"] = "none"
+                state["graph_spec"] = {"chart_type": "none", "x_key": "", "y_keys": []}
+                _emit_progress(state, "query_executed", "Query executed")
+                _emit_progress(state, "summary_generated", "Summary generated")
+                _emit_progress(
+                    state,
+                    "chart_recommendation_generated",
+                    "Chart recommendation generated",
+                )
                 state["result"] = state["summary"]
                 return state
 
             data = [dict(zip(columns, row)) for row in rows]
             state["columns"] = columns
             state["data"] = data
+            _emit_progress(state, "query_executed", "Query executed")
             try:
                 state["summary"] = generate_conversational_summary(
                     state, state.get("question", ""), columns, data
@@ -313,7 +431,17 @@ def execute_sql(state: GraphState) -> GraphState:
                 state["summary"] = generate_summary(
                     state.get("question", ""), columns, data
                 )
-            state["graph_hint"] = "auto"
+            _emit_progress(state, "summary_generated", "Summary generated")
+            graph_spec = generate_graph_spec(
+                state, state.get("question", ""), columns, data
+            )
+            state["graph_spec"] = graph_spec
+            _emit_progress(
+                state, "chart_recommendation_generated", "Chart recommendation generated"
+            )
+            state["graph_hint"] = (
+                "auto" if graph_spec.get("chart_type") != "none" else "none"
+            )
             state["result"] = state["summary"]
             return state
 
@@ -333,6 +461,16 @@ def execute_sql(state: GraphState) -> GraphState:
                     "summary", "I couldn't find any matching records for that question."
                 )
                 state.setdefault("graph_hint", "none")
+                state.setdefault(
+                    "graph_spec", {"chart_type": "none", "x_key": "", "y_keys": []}
+                )
+                _emit_progress(
+                    state,
+                    "query_executed",
+                    "Query executed",
+                    status="failed",
+                    meta={"reason": error_msg},
+                )
                 return state
 
             state["sql_query"] = fix_sql_with_error(
@@ -345,6 +483,7 @@ def execute_sql(state: GraphState) -> GraphState:
     state.setdefault("data", [])
     state.setdefault("summary", "I couldn't find any matching records for that question.")
     state.setdefault("graph_hint", "none")
+    state.setdefault("graph_spec", {"chart_type": "none", "x_key": "", "y_keys": []})
     return state
 
 
@@ -373,6 +512,7 @@ def run_pipeline(question: str, initial_state: Optional[GraphState] = None) -> G
             data=[],
             summary="",
             graph_hint="none",
+            graph_spec={"chart_type": "none", "x_key": "", "y_keys": []},
             profile_cache=None,
         )
 

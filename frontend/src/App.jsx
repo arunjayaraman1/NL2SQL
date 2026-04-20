@@ -2,6 +2,33 @@ import { useState, useRef, useEffect } from 'react'
 import ChatMessage from './components/ChatMessage'
 import axios from 'axios'
 
+const PROGRESS_STEPS = [
+  { step_id: 'schema_profile_loaded', label: 'Schema/profile loaded' },
+  { step_id: 'sql_drafted', label: 'SQL drafted' },
+  { step_id: 'schema_linking_complete', label: 'Schema linking complete' },
+  { step_id: 'sql_validated', label: 'SQL validated' },
+  { step_id: 'query_executed', label: 'Query executed' },
+  { step_id: 'summary_generated', label: 'Summary generated' },
+  { step_id: 'chart_recommendation_generated', label: 'Chart recommendation generated' }
+]
+
+const createProgressSteps = () => PROGRESS_STEPS.map((step) => ({ ...step, status: 'pending' }))
+
+const parseSseEvent = (rawEvent) => {
+  const lines = rawEvent.split('\n').map((line) => line.trim()).filter(Boolean)
+  const eventLine = lines.find((line) => line.startsWith('event:'))
+  const dataLine = lines.find((line) => line.startsWith('data:'))
+  if (!eventLine || !dataLine) return null
+
+  const event = eventLine.slice('event:'.length).trim()
+  const rawData = dataLine.slice('data:'.length).trim()
+  try {
+    return { event, data: JSON.parse(rawData) }
+  } catch {
+    return null
+  }
+}
+
 function App() {
   const [messages, setMessages] = useState([
     {
@@ -9,15 +36,23 @@ function App() {
       type: 'assistant',
       text: 'Hello! I\'m your NL2SQL assistant. Ask me questions about your database in plain English, and I\'ll convert them to SQL queries.',
       loading: false,
-      error: null
+      error: null,
+      needs_clarification: false,
+      suggested_inputs: []
     }
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedDb, setSelectedDb] = useState('')
   const [databases, setDatabases] = useState([])
+  const [startupSuggestions, setStartupSuggestions] = useState([])
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+
+  const applySuggestion = (suggestionText) => {
+    setInput(suggestionText || '')
+    inputRef.current?.focus()
+  }
 
   useEffect(() => {
     axios.get('/api/databases')
@@ -30,6 +65,42 @@ function App() {
       })
       .catch(() => setDatabases([]))
   }, [])
+
+  useEffect(() => {
+    if (!selectedDb) {
+      setStartupSuggestions([])
+      return
+    }
+
+    let cancelled = false
+    axios.get('/api/suggestions', { params: { db_id: selectedDb } })
+      .then((res) => {
+        if (cancelled) return
+        const suggestions = Array.isArray(res.data?.suggested_inputs)
+          ? res.data.suggested_inputs.slice(0, 3)
+          : []
+        setStartupSuggestions(suggestions)
+      })
+      .catch(() => {
+        if (!cancelled) setStartupSuggestions([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedDb])
+
+  useEffect(() => {
+    setMessages((prev) => prev.map((msg) =>
+      msg.id === 0
+        ? {
+            ...msg,
+            needs_clarification: startupSuggestions.length > 0,
+            suggested_inputs: startupSuggestions
+          }
+        : msg
+    ))
+  }, [startupSuggestions])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -61,27 +132,114 @@ function App() {
       sql_query: null,
       columns: [],
       data: [],
-      row_count: 0
+      row_count: 0,
+      graph_hint: 'none',
+      graph_spec: { chart_type: 'none', x_key: '', y_keys: [] },
+      progress_steps: createProgressSteps(),
+      needs_clarification: false,
+      suggested_inputs: []
     }
 
     setMessages(prev => [...prev, userMessage, assistantMessage])
 
     try {
-      const response = await axios.post('/api/query', {
-        question: questionText,
-        db_id: selectedDb
+      const response = await fetch('/api/query/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: questionText,
+          db_id: selectedDb
+        })
       })
+
+      if (!response.ok || !response.body) {
+        const fallback = await axios.post('/api/query', {
+          question: questionText,
+          db_id: selectedDb
+        })
+        const fallbackData = fallback.data || {}
+        setMessages(prev => prev.map(msg =>
+          msg.id === assistantMessage.id
+            ? {
+                ...msg,
+                loading: false,
+                error: fallbackData.error || null,
+                summary: fallbackData.summary,
+                sql_query: fallbackData.sql_query,
+                columns: fallbackData.columns,
+                data: fallbackData.data,
+                row_count: fallbackData.data?.length || 0,
+                graph_hint: fallbackData.graph_hint || 'auto',
+                graph_spec: fallbackData.graph_spec || { chart_type: 'none', x_key: '', y_keys: [] },
+                needs_clarification: Boolean(fallbackData.needs_clarification),
+                suggested_inputs: Array.isArray(fallbackData.suggested_inputs) ? fallbackData.suggested_inputs : []
+              }
+            : msg
+        ))
+        return
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let finalData = null
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        let separatorIndex = buffer.indexOf('\n\n')
+        while (separatorIndex !== -1) {
+          const rawEvent = buffer.slice(0, separatorIndex).trim()
+          buffer = buffer.slice(separatorIndex + 2)
+          separatorIndex = buffer.indexOf('\n\n')
+
+          if (!rawEvent) continue
+          const parsed = parseSseEvent(rawEvent)
+          if (!parsed) continue
+
+          if (parsed.event === 'progress') {
+            const stepId = parsed.data?.step_id
+            const status = parsed.data?.status || 'completed'
+            setMessages(prev => prev.map(msg =>
+              msg.id === assistantMessage.id
+                ? {
+                    ...msg,
+                    progress_steps: (msg.progress_steps || []).map((step) =>
+                      step.step_id === stepId ? { ...step, status } : step
+                    )
+                  }
+                : msg
+            ))
+          } else if (parsed.event === 'result') {
+            finalData = parsed.data
+          } else if (parsed.event === 'error') {
+            throw new Error(parsed.data?.error || 'An error occurred')
+          }
+        }
+      }
+
+      if (!finalData) {
+        throw new Error('Stream ended before final result')
+      }
 
       setMessages(prev => prev.map(msg =>
         msg.id === assistantMessage.id
           ? {
               ...msg,
               loading: false,
-              summary: response.data.summary,
-              sql_query: response.data.sql_query,
-              columns: response.data.columns,
-              data: response.data.data,
-              row_count: response.data.data?.length || 0
+              error: finalData.error || null,
+              summary: finalData.summary || null,
+              sql_query: finalData.sql_query || null,
+              columns: finalData.columns || [],
+              data: finalData.data || [],
+              row_count: finalData.data?.length || 0,
+              graph_hint: finalData.graph_hint || 'auto',
+              graph_spec: finalData.graph_spec || { chart_type: 'none', x_key: '', y_keys: [] },
+              needs_clarification: Boolean(finalData.needs_clarification),
+              suggested_inputs: Array.isArray(finalData.suggested_inputs) ? finalData.suggested_inputs : [],
+              progress_steps: (msg.progress_steps || []).map((step) => ({ ...step, status: 'completed' }))
             }
           : msg
       ))
@@ -103,7 +261,9 @@ function App() {
       type: 'assistant',
       text: 'Chat cleared! Ask me a new question about your database.',
       loading: false,
-      error: null
+      error: null,
+      needs_clarification: startupSuggestions.length > 0,
+      suggested_inputs: startupSuggestions
     }])
   }
 
@@ -149,7 +309,11 @@ function App() {
       <main className="flex-1 overflow-y-auto">
         <div className="w-full px-6 py-6 space-y-6">
           {messages.map((message) => (
-            <ChatMessage key={message.id} message={message} />
+            <ChatMessage
+              key={message.id}
+              message={message}
+              onSuggestionClick={applySuggestion}
+            />
           ))}
           <div ref={messagesEndRef} />
         </div>
