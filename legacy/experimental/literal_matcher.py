@@ -126,7 +126,7 @@ def _tokenize(text: str) -> list[str]:
 def get_database_hash(conn: psycopg2.extensions.connection) -> str:
     """Get database hash (reuse from profiler if available)."""
     try:
-        from profiler import get_database_hash as profiler_hash
+        from backend.core.profiler import get_database_hash as profiler_hash
 
         return profiler_hash(conn)
     except ImportError:

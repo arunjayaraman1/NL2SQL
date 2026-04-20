@@ -32,17 +32,21 @@ def extract_tables_from_sql(sql: str) -> Set[str]:
 
     sql_upper = sql.upper()
 
-    from_pattern = r"FROM\s+(\w+)"
+    # Capture optional schema qualifier so we recognise both "employees" and
+    # "hr.employees" as table references.
+    qualified = r"(\w+(?:\.\w+)?)"
+
+    from_pattern = rf"FROM\s+{qualified}"
     for match in re.finditer(from_pattern, sql_upper, re.IGNORECASE):
         tables.add(match.group(1).lower())
 
     join_patterns = [
-        r"JOIN\s+(\w+)",
-        r"INNER\s+JOIN\s+(\w+)",
-        r"LEFT\s+JOIN\s+(\w+)",
-        r"RIGHT\s+JOIN\s+(\w+)",
-        r"LEFT\s+OUTER\s+JOIN\s+(\w+)",
-        r"RIGHT\s+OUTER\s+JOIN\s+(\w+)",
+        rf"JOIN\s+{qualified}",
+        rf"INNER\s+JOIN\s+{qualified}",
+        rf"LEFT\s+JOIN\s+{qualified}",
+        rf"RIGHT\s+JOIN\s+{qualified}",
+        rf"LEFT\s+OUTER\s+JOIN\s+{qualified}",
+        rf"RIGHT\s+OUTER\s+JOIN\s+{qualified}",
     ]
 
     for pattern in join_patterns:
@@ -167,12 +171,24 @@ def build_linked_schema(
     """
     lines = []
 
+    # Build case-insensitive lookup so the linker can resolve qualified names
+    # (schema.table) and fall back to a schema-less match when the LLM
+    # references a table without its schema prefix.
+    cache_lookup: dict[str, str] = {k.lower(): k for k in profile_cache.tables}
+
     for table_name in sorted(used_tables):
         table_key = table_name.lower()
-        if table_key not in profile_cache.tables:
+        resolved = cache_lookup.get(table_key)
+        if resolved is None and "." not in table_key:
+            # Try suffix match: "employees" -> "hr.employees" (first hit wins).
+            for key_lower, key_original in cache_lookup.items():
+                if key_lower.endswith(f".{table_key}"):
+                    resolved = key_original
+                    break
+        if resolved is None:
             continue
 
-        table = profile_cache.tables[table_key]
+        table = profile_cache.tables[resolved]
         lines.append(f"\nTable: {table.name}")
 
         for col_name, col in table.columns.items():

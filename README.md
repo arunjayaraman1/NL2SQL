@@ -1,391 +1,189 @@
-# NL2SQL - Natural Language to SQL Converter
+# NL2SQL
 
-A full-stack application that converts natural language questions into SQL queries. Uses **React 18** (Vite), **FastAPI**, **PostgreSQL** (HR Database), and **OpenRouter LLM**.
+Natural-language to SQL assistant with a React chat UI, FastAPI backend, PostgreSQL data source, and OpenRouter-based LLM generation.
 
----
+## Project Analysis (Current State)
 
-## Features
+- **Architecture is now unified**: both API and CLI use the same shared pipeline in `backend/core/nl2sql_pipeline.py`.
+- **Multi-database flow is active**: database options come from `databases.json` through `backend/core/db_registry.py`, and users can select DBs in the UI.
+- **Schema discovery is dynamic**: PostgreSQL schemas are discovered automatically and applied to `search_path` per selected database.
+- **Core runtime is cleanly separated**: production modules are under `backend/core`; optional modules were moved to `legacy/experimental`.
+- **Some legacy docs drift existed**: old README sections referenced removed modules/endpoints and outdated payload fields (`db_type`); this README fixes that.
 
-### Core Features
-- **Natural Language to SQL**: Ask questions in plain English, get SQL results
-- **Clean Chat UI**: AI chatbot-style interface with typing indicators
-- **SQL Display**: Shows generated SQL with syntax highlighting
-- **Results Table**: Displays query results with all rows visible
+## Tech Stack
 
-### Enhanced NL2SQL Features
-- **Schema Linking**: Two-pass SQL generation (extract → filter → refine)
-- **SQL Validation**: Auto-detects missing clauses (ORDER BY, LIMIT, GROUP BY)
-- **Literal Matching**: Maps user terms to database values (e.g., "Sales" → departments.name)
-- **Column Summarization**: LLM-generated semantic descriptions for columns
-- **Intent Hints**: Dynamically adds hints based on query patterns
-- **Query Logging**: Tracks all queries with execution metadata and analytics
+- **Frontend**: React 18, Vite, Axios, TailwindCSS
+- **Backend**: FastAPI, Uvicorn, LangGraph
+- **LLM**: OpenRouter via `langchain-openai` (`ChatOpenAI`)
+- **Database**: PostgreSQL 16
+- **Infra**: Docker Compose
 
-### Performance & Caching
-- **Database Profiling**: Cached metadata (null counts, FK/PK detection, stats)
-- **Column Summaries**: Cached semantic descriptions (24-hour TTL)
-- **Literal Index**: Pre-indexed values for fast term matching
-- **Retry Loop**: Automatic SQL error recovery (up to 3 attempts)
+## Runtime Structure
 
-### Deployment
-- **Docker Ready**: Full stack deployment with Docker Compose
-- **React Frontend**: Vite build with Tailwind CSS
-- **FastAPI Backend**: Async API with caching
+```text
+NL2SQL/
+├── app.py                        # CLI entry point (uses shared pipeline)
+├── backend/
+│   ├── main.py                   # FastAPI app and API routes
+│   ├── requirements.txt
+│   └── core/
+│       ├── db_registry.py        # DB registry + schema discovery + connections
+│       ├── nl2sql_pipeline.py    # LangGraph pipeline (fetch_schema -> generate -> execute)
+│       ├── profiler.py           # DB profiling + cache
+│       ├── schema_linker.py      # Two-pass schema linking
+│       ├── sql_prompt.py         # Prompt builder
+│       ├── validator.py          # SQL validation/autofix
+│       └── hr_examples.py        # Few-shot examples
+├── frontend/
+│   ├── src/App.jsx               # Chat app + DB selector
+│   └── src/components/ChatMessage.jsx
+├── docker-compose.yml
+├── databases.example.json
+├── databases.json                # local DB registry (gitignored)
+├── docker/db/init/02-hr_schema.sql
+└── legacy/
+    ├── data/                     # archived SQL/data assets
+    └── experimental/             # optional non-runtime modules
+```
 
----
+## How It Works
+
+1. Frontend loads databases from `GET /api/databases`.
+2. User chooses a database and sends a question to `POST /api/query`.
+3. Backend resolves `db_id` and loads/refreshes profile cache for that database.
+4. Shared pipeline runs:
+   - fetch schema/profile context
+   - generate SQL (with prompt + schema linking + validator)
+   - execute SQL with retry logic (SELECT only)
+5. Response returns SQL, tabular results, and summary text.
 
 ## Prerequisites
 
-- Python 3.10+
-- Node.js 18+
-- PostgreSQL (local or Docker)
-- Docker & Docker Compose
-- OpenRouter API Key (https://openrouter.ai/keys)
+- Docker + Docker Compose (recommended)
+- Or local: Python 3.11+ and Node 18+
+- OpenRouter API key
 
----
+## Configuration
 
-## Project Structure
-
-```
-NL2SQL/
-├── sql_prompt.py              # NL→SQL prompt builder with hints
-├── profiler.py                # Database profiling with caching
-├── column_summarizer.py      # LLM column summarization
-├── schema_linker.py           # Two-pass schema linking
-├── literal_matcher.py         # Literal value matching
-├── validator.py               # SQL validation layer
-├── query_logger.py            # Query logging and analytics
-├── hr_examples.py             # Few-shot examples (5)
-├── backend/
-│   ├── main.py                # FastAPI server
-│   └── requirements.txt       # Python dependencies
-├── frontend/                  # React 18 + Vite
-│   ├── src/
-│   │   ├── App.jsx           # Main app component
-│   │   ├── main.jsx          # Entry point
-│   │   ├── index.css          # Tailwind styles
-│   │   └── components/
-│   │       └── ChatMessage.jsx # Chat message component
-│   ├── package.json
-│   ├── vite.config.js
-│   ├── index.html
-│   └── nginx.conf
-├── docker-compose.yml         # Docker full stack
-└── .env                      # Environment variables
-```
-
----
-
-## Installation
-
-### Environment Configuration
+1. Copy environment template:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
-
-```env
-# Database Configuration
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=hr_db
-DB_USER=postgres
-DB_PASSWORD=your_password
-
-# OpenRouter LLM Configuration
-OPENAI_API_KEY=your_openrouter_api_key
-LLM_MODEL=meta-llama/llama-3.3-70b-instruct
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-LLM_TEMPERATURE=0.2
-LLM_MAX_TOKENS=1024
-
-# Cache settings
-PROFILE_CACHE_TTL=3600
-COLUMN_CACHE_TTL=86400
-LITERAL_CACHE_TTL=86400
-```
-
-### Docker Setup (Recommended)
+2. Create database registry file:
 
 ```bash
-# Build and start all services
-docker-compose up --build
+cp databases.example.json databases.json
+```
 
-# Verify containers
-docker ps
+3. Update credentials:
+
+- `.env` contains shared DB creds and model settings.
+- `databases.json` maps logical DB IDs (`hr`, `sales`, etc.) to actual PostgreSQL connections.
+
+### Important Env Notes
+
+- Backend currently reads API key from `OPENAI_API_KEY`.
+- Keep `DATABASES_CONFIG` pointing to your registry file (Docker uses `/app/databases.json`).
+
+## Run with Docker (Recommended)
+
+```bash
+docker compose up --build
 ```
 
 Services:
-- Frontend: http://localhost:3001
-- Backend API: http://localhost:8000
-- PostgreSQL: localhost:5432
 
-### Local Development
+- Frontend: `http://localhost:3001`
+- Backend: `http://localhost:8000`
+- PostgreSQL: `localhost:5432`
 
-**Backend:**
+## Local Development
+
+### Backend
+
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python main.py
+python -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+uvicorn backend.main:app --reload --port 8000
 ```
 
-**Frontend:**
+### Frontend
+
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
----
+## API Reference
 
-## API Endpoints
+### `GET /api/databases`
 
-### Query Endpoints
+Returns configured DB list for UI selector.
 
-```bash
-# Main query endpoint
-POST /api/query
+### `GET /api/databases/{db_id}/schemas`
+
+Returns discovered schemas for the selected DB.
+
+### `GET /api/profile?db_id=...`
+
+Returns profile metadata/cache stats for one DB.
+
+### `POST /api/refresh-profile`
+
+Request body:
+
+```json
+{ "db_id": "hr" }
+```
+
+### `POST /api/query`
+
+Request body:
+
+```json
+{ "question": "How many employees are in each department?", "db_id": "hr" }
+```
+
+Response shape:
+
+```json
 {
-  "question": "How many employees in each department?",
-  "db_type": "hr",
-  "use_retry": true,
-  "use_schema_linking": false
+  "sql_query": "SELECT ...",
+  "columns": ["col1", "col2"],
+  "data": [{ "col1": "v1", "col2": "v2" }],
+  "summary": "Found 10 records.",
+  "graph_hint": "auto"
 }
 ```
 
-### Cache Endpoints
+## CLI Usage
+
+`app.py` uses the same backend pipeline:
 
 ```bash
-# Get/refresh profile cache
-GET  /api/profile
-POST /api/refresh-profile
-
-# Get/refresh column summaries
-GET  /api/column-summaries
-POST /api/refresh-summaries
-
-# Get/refresh literal index
-GET  /api/literals
-POST /api/refresh-literals
-
-# Match terms in question to database values
-POST /api/match-literals
-{"question": "Show employees in Sales"}
+python app.py --db-id hr "Show top 5 employees by salary"
 ```
 
-### Other Endpoints
+Useful flags:
 
-```bash
-# List available databases
-GET /api/databases
-```
-
-### Query Logs Endpoints
-
-```bash
-# Get recent query logs
-GET /api/logs
-GET /api/logs?limit=20&offset=0&success=true&db_type=hr
-
-# Get specific log by ID
-GET /api/logs/{log_id}
-
-# Get query statistics
-GET /api/logs/stats
-GET /api/logs/stats?days=30&db_type=hr
-
-# Clear old logs
-DELETE /api/logs/clear?days=30
-```
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    User Interface (React 18)                      │
-│                    http://localhost:3001                        │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼ nginx proxy
-┌─────────────────────────────────────────────────────────────────┐
-│                       FastAPI Backend                            │
-│                      (backend/main.py)                          │
-│                         Port 8000                                │
-├─────────────────────────────────────────────────────────────────┤
-│  Caches (loaded on startup):                                     │
-│  ├── Profile Cache (1h)    → stats, FK/PK, null counts        │
-│  ├── Column Summaries (24h) → LLM semantic descriptions        │
-│  └── Literal Index (24h)   → pre-indexed values                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Pipeline:                                                       │
-│  1. Load/refresh caches                                         │
-│  2. Match literal terms in question                            │
-│  3. Build enhanced schema (profiled + summarized)              │
-│  4. Generate SQL with LLM                                       │
-│  5. Validate SQL (auto-fix missing clauses)                     │
-│  6. Execute against PostgreSQL                                  │
-│  7. Generate summary                                            │
-│  8. Retry on error (max 3x)                                    │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      PostgreSQL (hr_db)                          │
-│                         Port 5432                                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Enhanced Features Detail
-
-### 1. Schema Linking (Two-Pass)
-
-Pass 1: Generate SQL with full schema
-Pass 2: Extract used tables, filter schema, refine SQL
-
-This reduces hallucinations by focusing the LLM on only relevant tables.
-
-### 2. SQL Validation
-
-Auto-detects and fixes missing clauses:
-- Missing `ORDER BY` when user asks for "top" or "bottom"
-- Missing `LIMIT` when user asks for "top N"
-- Missing `GROUP BY` for aggregation queries
-- Missing `HAVING` when filtering aggregated results
-
-### 3. Literal Matching
-
-Pre-indexes column values for fast lookup:
-- "Sales" → matches `departments.name`
-- "John Smith" → matches `employees.first_name`, `employees.last_name`
-
-Provides hints to LLM for accurate WHERE clauses.
-
-### 4. Column Summarization
-
-LLM generates semantic descriptions for columns:
-- `[ID] Unique identifier for each employee`
-- `[Status] Employment status (active/terminated/on_leave)`
-
-Fallback rules for common column patterns.
-
-### 5. Query Logging
-
-All queries are logged with metadata for analytics and debugging:
-- Question, SQL, success/failure status
-- Execution time, row count, retry count
-- Session ID for multi-turn conversations
-- Statistics: success rate, avg execution time, top questions
-
----
-
-## Sample Questions
-
-| Question | SQL Pattern |
-|----------|-------------|
-| How many employees in each department? | GROUP BY + COUNT |
-| Show top 5 highest paid employees | ORDER BY + LIMIT |
-| List employees in Sales department | JOIN + WHERE |
-| Average salary by job title | GROUP BY + AVG |
-| Employees hired after January 2024 | WHERE + date |
-| Count by status | GROUP BY + COUNT |
-
----
+- `--refresh-profile`
+- `--profile-only`
+- `--db-id <id>`
 
 ## Troubleshooting
 
-### Backend startup delay
-
-First startup takes 3-5 minutes because:
-1. Column summarization calls LLM for each column
-2. Literal indexing scans text columns
-
-After first run, caches are used and startup is instant.
-
-### Backend not responding
+- If `/api/databases` works but `/api/query` fails, verify `databases.json` host values (`db` for Docker network, not `localhost` inside backend container).
+- If backend cannot start, confirm `databases.json` exists and `DATABASES_CONFIG` points to it.
+- For container logs:
 
 ```bash
-# Check backend logs
-docker-compose logs backend
-
-# Wait for "Application startup complete" message
-# Then test API
-curl http://localhost:8000/api/databases
+docker compose logs -f backend
 ```
-
-### 502 Bad Gateway (nginx)
-
-Backend is still starting. Wait for startup to complete.
-
-### Refresh caches
-
-```bash
-# Refresh all caches
-curl -X POST http://localhost:8000/api/refresh-profile
-curl -X POST http://localhost:8000/api/refresh-summaries
-curl -X POST http://localhost:8000/api/refresh-literals
-```
-
-### Docker database reset
-
-```bash
-docker-compose down -v
-docker-compose up -d
-```
-
----
-
-## Quick Reference Commands
-
-```bash
-# Start with Docker
-docker-compose up --build
-
-# Check API health
-curl http://localhost:8000/api/databases
-
-# Test query
-curl -X POST http://localhost:8000/api/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "How many employees?"}'
-
-# Check profile
-curl http://localhost:8000/api/profile | jq
-
-# View literal matches
-curl -X POST http://localhost:8000/api/match-literals \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Show Sales employees"}'
-
-# Docker logs
-docker-compose logs -f backend
-```
-
----
-
-## Files Overview
-
-| File | Description |
-|------|-------------|
-| `sql_prompt.py` | Prompt builder with intent hints, dialect hints |
-| `profiler.py` | Database profiling with caching |
-| `column_summarizer.py` | LLM column summarization with fallbacks |
-| `schema_linker.py` | Two-pass schema linking |
-| `literal_matcher.py` | Literal value indexing and matching |
-| `validator.py` | SQL validation with auto-fix |
-| `query_logger.py` | Query logging and analytics |
-| `backend/main.py` | FastAPI server with all endpoints |
-| `frontend/src/App.jsx` | React main app component |
-| `frontend/src/components/ChatMessage.jsx` | Chat message component |
-
----
 
 ## License
 
-Private Project
+Private project.

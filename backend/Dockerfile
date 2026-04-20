@@ -9,15 +9,7 @@ COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend ./backend
-COPY sql_prompt.py ./sql_prompt.py
-COPY hr_examples.py ./hr_examples.py
-COPY profiler.py ./profiler.py
-COPY validator.py ./validator.py
-COPY schema_linker.py ./schema_linker.py
-COPY literal_matcher.py ./literal_matcher.py
-COPY column_summarizer.py ./column_summarizer.py
-COPY query_logger.py ./query_logger.py
-COPY database_discovery.py ./database_discovery.py
+COPY databases.example.json ./databases.example.json
 
 EXPOSE 8000
 

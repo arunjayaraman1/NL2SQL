@@ -12,5 +12,9 @@ __pycache__/
 
 # Database profiling cache
 profile_cache.json
+profile_cache/
 column_summary_cache.json
 literal_cache.json
+
+# Database registry (contains connection info)
+databases.json

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import TypedDict
 
-from hr_examples import FEW_SHOT_EXAMPLES, get_few_shot_examples
+from .hr_examples import FEW_SHOT_EXAMPLES, get_few_shot_examples
 
 
 def format_profiled_schema(cache, table_names: list[str] = None) -> str:
@@ -18,7 +18,7 @@ def format_profiled_schema(cache, table_names: list[str] = None) -> str:
     Format profiled schema for LLM prompts.
     This function is imported from profiler.py at runtime to avoid circular imports.
     """
-    from profiler import format_profiled_schema as _format
+    from .profiler import format_profiled_schema as _format
 
     return _format(cache, table_names)
 
@@ -37,7 +37,7 @@ def format_enhanced_schema(
     Returns:
         Formatted schema string with column summaries
     """
-    from profiler import format_profiled_schema as _format_base
+    from .profiler import format_profiled_schema as _format_base
 
     base_schema = _format_base(profile_cache, table_names)
 
@@ -75,7 +75,7 @@ def get_intent_hints(question: str) -> str:
     Get intent-based hints for the prompt.
     Imported from validator.py at runtime to avoid circular imports.
     """
-    from validator import build_intent_hints
+    from .validator import build_intent_hints
 
     return build_intent_hints(question)
 
@@ -89,7 +89,10 @@ def get_literal_hints(question: str, literal_cache=None) -> str:
         return ""
 
     try:
-        from literal_matcher import match_terms_in_question, format_literal_hints
+        from legacy.experimental.literal_matcher import (
+            format_literal_hints,
+            match_terms_in_question,
+        )
 
         matches = match_terms_in_question(question, literal_cache)
         return format_literal_hints(matches)
@@ -116,6 +119,10 @@ POSTGRES_HINTS = """PostgreSQL dialect (target database):
 - When the user asks for the top N rows, add LIMIT N (e.g. LIMIT 10).
 - Use COALESCE for handling NULL values with defaults.
 - For complex aggregations, use HAVING after GROUP BY.
+- Tables in the schema below are listed as schema.table. Reference them with
+  that full qualified form (e.g. hr.employees) whenever two schemas could
+  contain a table with the same name; unqualified names are otherwise fine
+  because search_path is configured across every user schema.
 """
 
 
@@ -180,7 +187,7 @@ Rules:
 - Keep the query minimal - do exactly what is asked, nothing more.
 - Do not include explanations, markdown code fences, or comments outside the SQL.
 - Do not output anything before or after the SQL statement.
-
+- If the user asks anything other than a sql query, output an general message like normal conversation.
 SQL:"""
 
 

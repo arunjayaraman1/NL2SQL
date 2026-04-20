@@ -28,7 +28,10 @@ services:
     environment:
       DB_HOST: db
       DB_PORT: 5432
+      DATABASES_CONFIG: /app/databases.json
       CORS_ALLOW_ORIGINS: http://localhost:3001,http://localhost:3000
+    volumes:
+      - ./databases.json:/app/databases.json:ro
     depends_on:
       db:
         condition: service_healthy

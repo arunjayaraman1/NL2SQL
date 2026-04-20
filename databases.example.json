@@ -1,0 +1,18 @@
+{
+  "hr": {
+    "label": "HR Database",
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "hr_db",
+    "user": "${DB_USER}",
+    "password": "${DB_PASSWORD}"
+  },
+  "sales": {
+    "label": "Sales Database",
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "sales_db",
+    "user": "${DB_USER}",
+    "password": "${DB_PASSWORD}"
+  }
+}

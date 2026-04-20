@@ -14,14 +14,20 @@ function App() {
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [selectedDb, setSelectedDb] = useState('hr')
+  const [selectedDb, setSelectedDb] = useState('')
   const [databases, setDatabases] = useState([])
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
 
   useEffect(() => {
     axios.get('/api/databases')
-      .then(res => setDatabases(res.data.databases || []))
+      .then(res => {
+        const list = res.data.databases || []
+        setDatabases(list)
+        if (list.length > 0) {
+          setSelectedDb(prev => prev || list[0].id)
+        }
+      })
       .catch(() => setDatabases([]))
   }, [])
 
@@ -63,7 +69,7 @@ function App() {
     try {
       const response = await axios.post('/api/query', {
         question: questionText,
-        db_type: selectedDb
+        db_id: selectedDb
       })
 
       setMessages(prev => prev.map(msg =>
@@ -164,7 +170,7 @@ function App() {
             />
             <button
               type="submit"
-              disabled={!input.trim() || loading}
+              disabled={!input.trim() || loading || !selectedDb}
               className="px-6 py-3 bg-indigo-600 text-white font-medium rounded-xl hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
             >
               {loading ? (

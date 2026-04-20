@@ -9,7 +9,9 @@ Extracts smart metadata from database tables and columns:
 - Average length for text columns
 - Primary key and foreign key detection
 
-Supports caching to avoid re-profiling on every query.
+Profiles every non-system schema in the connected database and keys tables by
+their fully-qualified name (``schema.table``). Callers can pass a
+``cache_path`` so multiple databases each keep their own profile cache file.
 """
 
 from __future__ import annotations
@@ -23,10 +25,19 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
+from psycopg2 import sql as _sql
 
 
 CACHE_FILE = os.getenv("PROFILE_CACHE_FILE", "profile_cache.json")
 DEFAULT_EXPIRY = int(os.getenv("PROFILE_CACHE_TTL", "3600"))
+
+# Keep in sync with db_registry.SYSTEM_SCHEMAS.
+_SYSTEM_SCHEMAS: tuple[str, ...] = (
+    "pg_catalog",
+    "information_schema",
+    "pg_toast",
+    "pg_temp",
+)
 
 
 @dataclass
@@ -54,16 +65,20 @@ class ProfileColumn:
 
 @dataclass
 class ProfileTable:
+    """A profiled table. ``name`` is the qualified ``schema.table`` name."""
+
     name: str
     row_count: int
     column_count: int
     columns: dict[str, ProfileColumn] = field(default_factory=dict)
+    schema: str = "public"
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "row_count": self.row_count,
             "column_count": self.column_count,
+            "schema": self.schema,
             "columns": {k: v.to_dict() for k, v in self.columns.items()},
         }
 
@@ -74,6 +89,7 @@ class ProfileTable:
             name=data["name"],
             row_count=data["row_count"],
             column_count=data["column_count"],
+            schema=data.get("schema", "public"),
             columns=columns,
         )
 
@@ -111,26 +127,47 @@ class ProfileCache:
         return cls.from_dict(json.loads(json_str))
 
 
+# =============================================================================
+# LOW-LEVEL HELPERS
+# =============================================================================
+
+
+def _qualified(schema: str, table: str) -> str:
+    return f"{schema}.{table}"
+
+
+def _ident(schema: str, table: str) -> _sql.Composed:
+    return _sql.SQL("{}.{}").format(_sql.Identifier(schema), _sql.Identifier(table))
+
+
 def get_database_hash(conn: psycopg2.extensions.connection) -> str:
-    """Generate a hash based on database name and all table schemas."""
+    """Generate a hash based on database name and all user-schema column layouts."""
     cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT table_schema, table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema NOT IN %s
+              AND table_schema NOT LIKE 'pg_temp_%%'
+              AND table_schema NOT LIKE 'pg_toast_%%'
+            ORDER BY table_schema, table_name, ordinal_position
+            """,
+            (_SYSTEM_SCHEMAS,),
+        )
+        columns = cursor.fetchall()
 
-    cursor.execute("""
-        SELECT table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-        ORDER BY table_name, ordinal_position
-    """)
-    columns = cursor.fetchall()
-
-    cursor.execute("SELECT current_database()")
-    db_name = cursor.fetchone()[0]
+        cursor.execute("SELECT current_database()")
+        db_name = cursor.fetchone()[0]
+    finally:
+        cursor.close()
 
     schema_str = json.dumps(
-        {"database": db_name, "schema": [(t, c, dt) for t, c, dt in columns]}
+        {
+            "database": db_name,
+            "schema": [(s, t, c, dt) for s, t, c, dt in columns],
+        }
     )
-
-    cursor.close()
     return hashlib.md5(schema_str.encode()).hexdigest()
 
 
@@ -169,7 +206,7 @@ def is_cache_valid(cache: ProfileCache, current_hash: str) -> bool:
 
 
 def get_table_primary_keys(
-    conn: psycopg2.extensions.connection, table_name: str
+    conn: psycopg2.extensions.connection, schema: str, table_name: str
 ) -> set[str]:
     """Get primary key columns for a table."""
     cursor = conn.cursor()
@@ -180,11 +217,12 @@ def get_table_primary_keys(
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
-            WHERE tc.table_name = %s
-                AND tc.constraint_type = 'PRIMARY KEY'
-                AND tc.table_schema = 'public'
-        """,
-            (table_name,),
+               AND tc.table_schema = kcu.table_schema
+            WHERE tc.table_schema = %s
+              AND tc.table_name = %s
+              AND tc.constraint_type = 'PRIMARY KEY'
+            """,
+            (schema, table_name),
         )
         return {row[0] for row in cursor.fetchall()}
     finally:
@@ -192,35 +230,43 @@ def get_table_primary_keys(
 
 
 def get_table_foreign_keys(
-    conn: psycopg2.extensions.connection, table_name: str
+    conn: psycopg2.extensions.connection, schema: str, table_name: str
 ) -> dict[str, str]:
-    """Get foreign key mappings for a table. Returns {column: referenced_table.column}."""
+    """Return {column: "schema.table.column"} for foreign keys on a table."""
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
             SELECT
                 kcu.column_name,
+                ccu.table_schema AS referenced_schema,
                 ccu.table_name AS referenced_table,
                 ccu.column_name AS referenced_column
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
+               AND tc.table_schema = kcu.table_schema
             JOIN information_schema.constraint_column_usage ccu
                 ON tc.constraint_name = ccu.constraint_name
-            WHERE tc.table_name = %s
-                AND tc.constraint_type = 'FOREIGN KEY'
-                AND tc.table_schema = 'public'
-        """,
-            (table_name,),
+               AND tc.table_schema = ccu.table_schema
+            WHERE tc.table_schema = %s
+              AND tc.table_name = %s
+              AND tc.constraint_type = 'FOREIGN KEY'
+            """,
+            (schema, table_name),
         )
-        return {row[0]: f"{row[1]}.{row[2]}" for row in cursor.fetchall()}
+        return {
+            row[0]: f"{row[1]}.{row[2]}.{row[3]}" for row in cursor.fetchall()
+        }
     finally:
         cursor.close()
 
 
 def get_column_type(
-    conn: psycopg2.extensions.connection, table_name: str, column_name: str
+    conn: psycopg2.extensions.connection,
+    schema: str,
+    table_name: str,
+    column_name: str,
 ) -> str:
     """Get the data type of a column."""
     cursor = conn.cursor()
@@ -229,11 +275,11 @@ def get_column_type(
             """
             SELECT data_type
             FROM information_schema.columns
-            WHERE table_name = %s
-                AND column_name = %s
-                AND table_schema = 'public'
-        """,
-            (table_name, column_name),
+            WHERE table_schema = %s
+              AND table_name = %s
+              AND column_name = %s
+            """,
+            (schema, table_name, column_name),
         )
         result = cursor.fetchone()
         return result[0] if result else "unknown"
@@ -241,8 +287,14 @@ def get_column_type(
         cursor.close()
 
 
+# =============================================================================
+# PROFILING
+# =============================================================================
+
+
 def profile_column(
     conn: psycopg2.extensions.connection,
+    schema: str,
     table_name: str,
     column_name: str,
     primary_keys: set[str],
@@ -250,10 +302,13 @@ def profile_column(
 ) -> ProfileColumn:
     """Profile a single column."""
     cursor = conn.cursor()
-    data_type = get_column_type(conn, table_name, column_name)
+    data_type = get_column_type(conn, schema, table_name, column_name)
 
     try:
-        cursor.execute(f'SELECT "{column_name}" FROM "{table_name}"')
+        stmt = _sql.SQL("SELECT {} FROM {}").format(
+            _sql.Identifier(column_name), _ident(schema, table_name)
+        )
+        cursor.execute(stmt)
         all_values = [row[0] for row in cursor.fetchall()]
 
         total_count = len(all_values)
@@ -263,8 +318,6 @@ def profile_column(
 
         def make_hashable(v):
             if isinstance(v, (list, dict)):
-                import json
-
                 return json.dumps(v, sort_keys=True)
             return v
 
@@ -354,7 +407,6 @@ def profile_column(
 
 
 def _is_numeric(value) -> bool:
-    """Check if a value can be converted to float."""
     try:
         float(value)
         return True
@@ -363,86 +415,137 @@ def _is_numeric(value) -> bool:
 
 
 def profile_table(
-    conn: psycopg2.extensions.connection, table_name: str
+    conn: psycopg2.extensions.connection, schema: str, table_name: str
 ) -> ProfileTable:
-    """Profile a single table."""
+    """Profile a single table in the given schema."""
     cursor = conn.cursor()
+    try:
+        count_stmt = _sql.SQL("SELECT COUNT(*) FROM {}").format(
+            _ident(schema, table_name)
+        )
+        cursor.execute(count_stmt)
+        row_count = cursor.fetchone()[0]
 
-    cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
-    row_count = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (schema, table_name),
+        )
+        columns = [row[0] for row in cursor.fetchall()]
+    finally:
+        cursor.close()
 
-    cursor.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = %s AND table_schema = 'public'
-        ORDER BY ordinal_position
-    """,
-        (table_name,),
-    )
-    columns = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-
-    primary_keys = get_table_primary_keys(conn, table_name)
-    foreign_keys = get_table_foreign_keys(conn, table_name)
+    primary_keys = get_table_primary_keys(conn, schema, table_name)
+    foreign_keys = get_table_foreign_keys(conn, schema, table_name)
 
     profiled_columns = {}
     for col_name in columns:
         profiled_columns[col_name] = profile_column(
-            conn, table_name, col_name, primary_keys, foreign_keys
+            conn, schema, table_name, col_name, primary_keys, foreign_keys
         )
 
     return ProfileTable(
-        name=table_name,
+        name=_qualified(schema, table_name),
         row_count=row_count,
         column_count=len(columns),
         columns=profiled_columns,
+        schema=schema,
     )
 
 
-def get_all_tables(conn: psycopg2.extensions.connection) -> list[str]:
-    """Get list of all tables in public schema."""
+def get_all_tables(
+    conn: psycopg2.extensions.connection,
+    schemas: Optional[list[str]] = None,
+) -> list[tuple[str, str]]:
+    """
+    Return ``[(schema, table), ...]`` for every user table in the given schemas.
+
+    If ``schemas`` is None, enumerates every non-system schema in the database.
+    """
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-    """)
-    tables = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    return tables
+    try:
+        if schemas is None:
+            cursor.execute(
+                """
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema NOT IN %s
+                  AND table_schema NOT LIKE 'pg_temp_%%'
+                  AND table_schema NOT LIKE 'pg_toast_%%'
+                ORDER BY table_schema, table_name
+                """,
+                (_SYSTEM_SCHEMAS,),
+            )
+        else:
+            if not schemas:
+                return []
+            cursor.execute(
+                """
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema = ANY(%s)
+                ORDER BY table_schema, table_name
+                """,
+                (list(schemas),),
+            )
+        return [(s, t) for s, t in cursor.fetchall()]
+    finally:
+        cursor.close()
 
 
 def profile_database(
     conn: psycopg2.extensions.connection,
-    table_names: list[str] = None,
+    table_names: Optional[list[str]] = None,
+    schemas: Optional[list[str]] = None,
     force_refresh: bool = False,
+    cache_path: Optional[str] = None,
 ) -> ProfileCache:
     """
-    Profile the entire database or specific tables.
+    Profile every (or selected) user tables reachable through ``conn``.
 
     Args:
-        conn: Database connection
-        table_names: Optional list of tables to profile. If None, profiles all tables.
-        force_refresh: If True, ignore cache and profile fresh.
+        conn: Database connection.
+        table_names: Optional qualified table names (``"schema.table"``) to
+            restrict profiling to. When None all user tables are profiled.
+        schemas: Optional list of schemas to enumerate (ignored when
+            ``table_names`` is provided).
+        force_refresh: Ignore any on-disk cache and re-profile from scratch.
+        cache_path: Where to read/write the profile cache JSON. Defaults to
+            the module-level ``CACHE_FILE``.
 
     Returns:
-        ProfileCache with all profiled tables
+        A fresh (or cached) :class:`ProfileCache` keyed by ``schema.table``.
     """
-    cache_path = Path(CACHE_FILE)
+    effective_cache_path = cache_path or CACHE_FILE
     current_hash = get_database_hash(conn)
 
     if not force_refresh:
-        cached = load_profile_cache(CACHE_FILE)
+        cached = load_profile_cache(effective_cache_path)
         if cached and is_cache_valid(cached, current_hash):
             return cached
 
-    tables_to_profile = table_names or get_all_tables(conn)
-    tables_profile: dict[str, ProfileTable] = {}
+    targets: list[tuple[str, str]]
+    if table_names:
+        targets = []
+        for qname in table_names:
+            if "." in qname:
+                schema, table = qname.split(".", 1)
+            else:
+                schema, table = "public", qname
+            targets.append((schema, table))
+    else:
+        targets = get_all_tables(conn, schemas=schemas)
 
-    for table_name in tables_to_profile:
-        tables_profile[table_name] = profile_table(conn, table_name)
+    tables_profile: dict[str, ProfileTable] = {}
+    for schema, table_name in targets:
+        key = _qualified(schema, table_name)
+        tables_profile[key] = profile_table(conn, schema, table_name)
 
     cache = ProfileCache(
         database_hash=current_hash,
@@ -451,8 +554,13 @@ def profile_database(
         tables=tables_profile,
     )
 
-    save_profile_cache(cache, CACHE_FILE)
+    save_profile_cache(cache, effective_cache_path)
     return cache
+
+
+# =============================================================================
+# LLM-FRIENDLY FORMATTING
+# =============================================================================
 
 
 def format_profiled_column(column: ProfileColumn) -> str:
@@ -484,10 +592,7 @@ def format_profiled_column(column: ProfileColumn) -> str:
         parts.append(f"sample: {samples_str}")
 
     if column.min_value is not None and column.max_value is not None:
-        if column.avg_length is not None:
-            parts.append(f"range: [{column.min_value}, {column.max_value}]")
-        else:
-            parts.append(f"range: [{column.min_value}, {column.max_value}]")
+        parts.append(f"range: [{column.min_value}, {column.max_value}]")
 
     if column.avg_length is not None:
         parts.append(f"avg_len={column.avg_length}")
@@ -495,48 +600,47 @@ def format_profiled_column(column: ProfileColumn) -> str:
     return " | ".join(parts)
 
 
-def format_profiled_schema(cache: ProfileCache, table_names: list[str] = None) -> str:
+def format_profiled_schema(
+    cache: ProfileCache, table_names: Optional[list[str]] = None
+) -> str:
     """
     Format the profiled schema for use in LLM prompts.
 
+    Tables are rendered using their fully qualified names (``schema.table``).
+
     Args:
-        cache: The profile cache
-        table_names: Optional list of tables to include. If None, includes all.
-
-    Returns:
-        Formatted schema string
+        cache: The profile cache.
+        table_names: Optional list of qualified table names to include; if
+            omitted, includes every table in the cache.
     """
-    lines = []
+    lines: list[str] = []
 
-    tables_to_include = table_names if table_names else list(cache.tables.keys())
+    if table_names:
+        keys: list[str] = []
+        for name in table_names:
+            if name in cache.tables:
+                keys.append(name)
+            elif "." not in name:
+                # Accept legacy unqualified names by probing every schema.
+                for key in cache.tables:
+                    if key.endswith(f".{name}"):
+                        keys.append(key)
+    else:
+        keys = list(cache.tables.keys())
 
-    for table_name in tables_to_include:
-        if table_name not in cache.tables:
+    for key in keys:
+        if key not in cache.tables:
             continue
 
-        table = cache.tables[table_name]
+        table = cache.tables[key]
         lines.append(
             f"\nTable: {table.name} ({table.row_count} rows, {table.column_count} columns)"
         )
 
-        for col_name, column in table.columns.items():
+        for _, column in table.columns.items():
             lines.append(f"  - {format_profiled_column(column)}")
 
     return "\n".join(lines)
-
-
-def format_profiled_schema_for_db_type(cache: ProfileCache, db_type: str = None) -> str:
-    """Format schema for a specific database type (filters tables by db_type)."""
-    if db_type is None:
-        return format_profiled_schema(cache)
-
-    from backend.main import AVAILABLE_DATABASES
-
-    if db_type not in AVAILABLE_DATABASES:
-        return format_profiled_schema(cache)
-
-    allowed_tables = set(AVAILABLE_DATABASES[db_type]["tables"])
-    return format_profiled_schema(cache, table_names=list(allowed_tables))
 
 
 if __name__ == "__main__":
