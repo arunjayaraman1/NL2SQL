@@ -7,11 +7,11 @@
     "user": "${DB_USER}",
     "password": "${DB_PASSWORD}"
   },
-  "sales": {
-    "label": "Sales Database",
-    "host": "localhost",
+  "amazon": {
+    "label": "Amazon Marketplace",
+    "host": "db",
     "port": 5432,
-    "dbname": "sales_db",
+    "dbname": "amazon_db",
     "user": "${DB_USER}",
     "password": "${DB_PASSWORD}"
   }

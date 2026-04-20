@@ -10,6 +10,7 @@ works with multi-database configuration.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -54,6 +55,19 @@ def _strip_sql_fences(sql: str) -> str:
         if sql.lower().startswith("sql"):
             sql = sql[3:].strip()
     return sql
+
+
+def _strip_markdown_fences(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            # Drop fence markers and optional language line (e.g. ```text)
+            core = "\n".join(lines[1:-1]).strip()
+            if core.lower().startswith(("text\n", "markdown\n")):
+                core = core.split("\n", 1)[1].strip()
+            return core
+    return text
 
 
 def is_retryable_error(error_msg: str) -> bool:
@@ -121,14 +135,72 @@ Corrected SQL:"""
 
 def generate_summary(question: str, columns: list[str], data: list[dict]) -> str:
     if not data:
-        return "No results found."
+        return "I couldn't find any matching records for that question."
 
     if len(data) == 1:
         row = data[0]
         parts = [f"{col}: {row.get(col, 'N/A')}" for col in columns]
-        return f"Result: {', '.join(parts)}"
+        return f"I found one matching row: {', '.join(parts)}."
 
-    return f"Found {len(data)} records."
+    return f"I found {len(data)} matching rows."
+
+
+def _build_summary_payload(columns: list[str], data: list[dict]) -> str:
+    max_rows = 8
+    max_columns = 12
+    max_payload_chars = 3000
+
+    selected_columns = columns[:max_columns]
+    sampled_rows = []
+    for row in data[:max_rows]:
+        sampled_rows.append({column: row.get(column) for column in selected_columns})
+
+    payload = {
+        "row_count": len(data),
+        "included_row_count": len(sampled_rows),
+        "included_columns": selected_columns,
+        "rows": sampled_rows,
+    }
+    payload_text = json.dumps(payload, ensure_ascii=True, default=str)
+    if len(payload_text) > max_payload_chars:
+        payload_text = payload_text[: max_payload_chars - 3] + "..."
+    return payload_text
+
+
+def generate_conversational_summary(
+    state: GraphState, question: str, columns: list[str], data: list[dict]
+) -> str:
+    llm_builder = state.get("llm_builder")
+    if not callable(llm_builder):
+        raise RuntimeError("Pipeline state must include a callable llm_builder")
+
+    payload_text = _build_summary_payload(columns, data)
+    prompt = f"""You summarize SQL query results for end users.
+
+User question:
+{question}
+
+Result metadata:
+- row_count: {len(data)}
+- columns: {columns}
+
+Result sample (JSON, possibly truncated):
+{payload_text}
+
+Write a direct natural-language answer in 1-2 short sentences.
+Rules:
+- Answer the question directly.
+- If the question can be answered with yes/no from these results, start with Yes or No.
+- Use only the provided result data.
+- Do not mention SQL, query generation, or assumptions.
+- Plain text only (no markdown, no bullet points)."""
+    llm = llm_builder()
+    response = llm.invoke(prompt)
+    summary = _strip_markdown_fences(str(getattr(response, "content", "")).strip())
+    summary = " ".join(summary.split())
+    if not summary:
+        raise RuntimeError("Empty summary from LLM")
+    return summary
 
 
 def fetch_schema(state: GraphState) -> GraphState:
@@ -205,7 +277,7 @@ def execute_sql(state: GraphState) -> GraphState:
             state["result"] = f"Error: {state['error']}"
             state["columns"] = []
             state["data"] = []
-            state["summary"] = "No results found."
+            state["summary"] = "I couldn't find any matching records for that question."
             state["graph_hint"] = "none"
             return state
 
@@ -225,15 +297,22 @@ def execute_sql(state: GraphState) -> GraphState:
             if not rows:
                 state["columns"] = []
                 state["data"] = []
-                state["summary"] = "No results found."
+                state["summary"] = "I couldn't find any matching records for that question."
                 state["graph_hint"] = "none"
-                state["result"] = "No results found"
+                state["result"] = state["summary"]
                 return state
 
             data = [dict(zip(columns, row)) for row in rows]
             state["columns"] = columns
             state["data"] = data
-            state["summary"] = generate_summary(state.get("question", ""), columns, data)
+            try:
+                state["summary"] = generate_conversational_summary(
+                    state, state.get("question", ""), columns, data
+                )
+            except Exception:
+                state["summary"] = generate_summary(
+                    state.get("question", ""), columns, data
+                )
             state["graph_hint"] = "auto"
             state["result"] = state["summary"]
             return state
@@ -250,7 +329,9 @@ def execute_sql(state: GraphState) -> GraphState:
                 state["result"] = state["error"]
                 state.setdefault("columns", [])
                 state.setdefault("data", [])
-                state.setdefault("summary", "No results found.")
+                state.setdefault(
+                    "summary", "I couldn't find any matching records for that question."
+                )
                 state.setdefault("graph_hint", "none")
                 return state
 
@@ -262,7 +343,7 @@ def execute_sql(state: GraphState) -> GraphState:
     state["result"] = state["error"]
     state.setdefault("columns", [])
     state.setdefault("data", [])
-    state.setdefault("summary", "No results found.")
+    state.setdefault("summary", "I couldn't find any matching records for that question.")
     state.setdefault("graph_hint", "none")
     return state
 

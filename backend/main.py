@@ -200,11 +200,20 @@ def process_query(request: dict):
             "error": result["error"],
         }
 
+    data = result.get("data", [])
+    summary = (result.get("summary") or "").strip()
+    if not summary:
+        summary = (
+            "I couldn't find any matching records for that question."
+            if not data
+            else "I found results for your question. See the table below."
+        )
+
     return {
         "sql_query": result.get("sql_query", ""),
         "columns": result.get("columns", []),
-        "data": result.get("data", []),
-        "summary": result.get("summary", ""),
+        "data": data,
+        "summary": summary,
         "graph_hint": result.get("graph_hint", "auto"),
     }
 

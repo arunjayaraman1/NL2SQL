@@ -11,6 +11,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/db/init/02-hr_schema.sql:/docker-entrypoint-initdb.d/02-hr_schema.sql:ro
+      - ./docker/db/init/amazon_marketplace.sql:/docker-entrypoint-initdb.d/amazon_marketplace.sql:ro
       - ./docker/db/init/03-query_logs.sql:/docker-entrypoint-initdb.d/03-query_logs.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-hr_db}"]
