@@ -148,6 +148,12 @@ const buildCsv = (rows, columns) => {
   return `${header}\n${body}`
 }
 
+const formatTableCellValue = (value) => {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
 const downloadTextFile = (filename, content, mimeType) => {
   const blob = new Blob([content], { type: mimeType })
   const objectUrl = URL.createObjectURL(blob)
@@ -447,7 +453,7 @@ function ChatMessage({ message, onSuggestionClick }) {
                     <tr key={i} className="hover:bg-gray-50">
                       {columns?.map((col, j) => (
                         <td key={j} className="px-3 py-2 text-gray-700 text-xs">
-                          {row[col] !== null && row[col] !== undefined ? String(row[col]) : '—'}
+                          {formatTableCellValue(row[col])}
                         </td>
                       ))}
                     </tr>

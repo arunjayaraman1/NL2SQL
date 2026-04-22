@@ -54,6 +54,8 @@ class ProfileColumn:
     avg_length: Optional[float] = None
     is_primary_key: bool = False
     foreign_key: Optional[str] = None
+    is_json_type: bool = False
+    json_keys: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -336,6 +338,11 @@ def profile_column(
             )
             samples = [str(v[0]) for v in sorted_values[:5]]
 
+        is_json = _is_json_type(data_type)
+        json_keys: list[str] = []
+        if is_json and samples:
+            json_keys = _extract_json_keys(samples[:10])
+
         min_value = None
         max_value = None
         avg_length = None
@@ -400,6 +407,8 @@ def profile_column(
             avg_length=round(avg_length, 1) if avg_length else None,
             is_primary_key=is_pk,
             foreign_key=fk,
+            is_json_type=is_json,
+            json_keys=json_keys,
         )
 
     finally:
@@ -412,6 +421,39 @@ def _is_numeric(value) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _extract_json_keys(sampled_values: list, max_keys: int = 20) -> list[str]:
+    """Extract all unique top-level keys from JSON/JSONB values."""
+    if not sampled_values:
+        return []
+
+    all_keys: set[str] = set()
+    for val in sampled_values:
+        if val is None:
+            continue
+        try:
+            parsed = json.loads(val) if isinstance(val, str) else val
+            if isinstance(parsed, dict):
+                all_keys.update(parsed.keys())
+            elif isinstance(parsed, list) and parsed:
+                first_item = parsed[0]
+                if isinstance(first_item, dict):
+                    all_keys.update(first_item.keys())
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if len(all_keys) >= max_keys:
+            break
+
+    return sorted(list(all_keys))[:max_keys]
+
+
+def _is_json_type(data_type: str) -> bool:
+    """Check if data type is JSON or JSONB."""
+    if not data_type:
+        return False
+    return "json" in data_type.lower()
 
 
 def profile_table(
@@ -581,6 +623,9 @@ def format_profiled_column(column: ProfileColumn) -> str:
 
     if column.foreign_key:
         parts.append(f"FK\u2192{column.foreign_key}")
+
+    if column.is_json_type and column.json_keys:
+        parts.append(f"JSON keys: {column.json_keys}")
 
     if column.samples:
         if len(column.samples) <= 3:

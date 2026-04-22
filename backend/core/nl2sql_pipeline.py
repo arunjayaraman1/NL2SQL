@@ -94,6 +94,18 @@ def _strip_markdown_fences(text: str) -> str:
     return text
 
 
+def _should_enable_jsonb_querying(profile_cache: Optional[ProfileCache]) -> bool:
+    if profile_cache is None:
+        return False
+
+    for table in profile_cache.tables.values():
+        for column in table.columns.values():
+            data_type = str(getattr(column, "data_type", "")).lower()
+            if "json" in data_type:
+                return True
+    return False
+
+
 def is_retryable_error(error_msg: str) -> bool:
     error_lower = error_msg.lower()
 
@@ -329,14 +341,21 @@ def generate_sql(state: GraphState) -> GraphState:
     """Node 2: generate SQL, then refine with schema linking + validator."""
     question = state.get("question", "")
 
+    jsonb_enabled = _should_enable_jsonb_querying(state.get("profile_cache"))
+
     if state.get("profile_cache"):
         prompt = build_profiled_schema_prompt(
             state["profile_cache"],
             question,
             summary_cache=state.get("summary_cache"),
+            enable_jsonb_querying=jsonb_enabled,
         )
     else:
-        prompt = build_sql_generation_prompt(state.get("schema", ""), question)
+        prompt = build_sql_generation_prompt(
+            state.get("schema", ""),
+            question,
+            enable_jsonb_querying=jsonb_enabled,
+        )
 
     initial_sql = _llm_invoke(state, prompt)
     _emit_progress(state, "sql_drafted", "SQL drafted")

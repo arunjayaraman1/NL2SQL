@@ -293,7 +293,7 @@ function App() {
               </option>
             ))}
           </select>
-          
+
           {messages.length > 2 && (
             <button
               onClick={clearChat}

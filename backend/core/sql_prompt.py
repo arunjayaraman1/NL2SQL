@@ -125,6 +125,15 @@ POSTGRES_HINTS = """PostgreSQL dialect (target database):
   because search_path is configured across every user schema.
 """
 
+POSTGRES_JSONB_HINTS = """PostgreSQL JSONB hints:
+- Use -> to extract JSON object/array values and ->> to extract text values.
+- Use #> and #>> for nested JSON path extraction.
+- Use @> for JSONB containment filters (e.g. metadata @> '{"status":"active"}'::jsonb).
+- Use ? to check key existence, and ?| / ?& for any/all key checks.
+- Use jsonb_array_elements(...) to unnest JSON arrays when needed.
+- Cast extracted text values when comparing numerically or by date/time.
+"""
+
 
 def _dialect_hints_enabled() -> bool:
     return os.getenv("NL2SQL_INCLUDE_DIALECT_HINTS", "true").lower() not in (
@@ -148,6 +157,7 @@ def build_sql_generation_prompt(
     question: str,
     *,
     include_dialect_hints: bool | None = None,
+    enable_jsonb_querying: bool = False,
     literal_cache=None,
 ) -> str:
     """
@@ -161,6 +171,7 @@ def build_sql_generation_prompt(
     dialect_block = ""
     if include_dialect_hints:
         dialect_block = f"{POSTGRES_HINTS}\n\n"
+    jsonb_block = f"{POSTGRES_JSONB_HINTS}\n\n" if enable_jsonb_querying else ""
 
     few_shots = _format_few_shots()
     intent_hints = get_intent_hints(question)
@@ -170,7 +181,7 @@ def build_sql_generation_prompt(
     literal_block = f"\n{literal_hints}\n" if literal_hints else ""
 
     return f"""You are a PostgreSQL SQL expert. Given the database schema below and a user question, output a single SELECT query that answers the question.
-{intent_block}{literal_block}{dialect_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
+{intent_block}{literal_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
 
 {few_shots}
 
@@ -201,6 +212,7 @@ def build_profiled_schema_prompt(
     *,
     summary_cache=None,
     include_dialect_hints: bool | None = None,
+    enable_jsonb_querying: bool = False,
 ) -> str:
     """
     Build the user prompt for SQL generation using profiled schema.
@@ -217,6 +229,7 @@ def build_profiled_schema_prompt(
     dialect_block = ""
     if include_dialect_hints:
         dialect_block = f"{POSTGRES_HINTS}\n\n"
+    jsonb_block = f"{POSTGRES_JSONB_HINTS}\n\n" if enable_jsonb_querying else ""
 
     few_shots = _format_few_shots()
     profiled_schema = format_enhanced_schema(profile_cache, summary_cache)
@@ -224,7 +237,7 @@ def build_profiled_schema_prompt(
     intent_block = f"\n{intent_hints}\n" if intent_hints else ""
 
     return f"""You are a PostgreSQL SQL expert. Given the database schema below and a user question, output a single SELECT query that answers the question.
-{intent_block}{dialect_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
+{intent_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
 {few_shots}
 
 Current database schema (authoritative; use only these tables and columns):
