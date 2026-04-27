@@ -169,6 +169,50 @@ INTENT_PATTERNS = {
 }
 
 
+ERROR_TAXONOMY = {
+    "column_not_found": [
+        r"column.*does not exist",
+        r"column reference.*invalid",
+        r"column \".*\" does not exist",
+    ],
+    "table_not_found": [
+        r"relation.*does not exist",
+        r"table.*does not exist",
+        r"Invalid table.*not found",
+    ],
+    "operator_mismatch": [
+        r"operator does not exist",
+        r"op.*does not exist",
+        r"operator.*is not valid",
+    ],
+    "type_mismatch": [
+        r"Cannot cast",
+        r"cannot convert",
+        r"type.*does not match",
+        r"operator.*is not valid for",
+    ],
+    "syntax_error": [
+        r"syntax error",
+        r"unterminated",
+        r"ERROR.*at or near",
+    ],
+    "missing_group_by": [
+        r"must appear in.*GROUP BY",
+        r"aggregate function.*requires.*GROUP BY",
+    ],
+    "ambiguous_column": [
+        r"column reference.*is ambiguous",
+        r"ambiguous column name",
+    ],
+    "excessive_rows": [
+        r"result set.*large",
+        r"too many rows",
+    ],
+}
+
+MAX_ROWS_THRESHOLD = 1000
+
+
 @dataclass
 class ValidationResult:
     sql: str
@@ -176,6 +220,10 @@ class ValidationResult:
     issues: list[str] = field(default_factory=list)
     fixes_applied: list[str] = field(default_factory=list)
     detected_intents: list[str] = field(default_factory=list)
+    error_type: Optional[str] = None
+    suggested_fix: Optional[str] = None
+    execution_error: Optional[str] = None
+    row_count: Optional[int] = None
 
 
 def detect_intents(question: str) -> list[str]:
@@ -479,6 +527,190 @@ def validate_and_enhance_prompt(question: str) -> str:
         String with intent hints for the prompt
     """
     return build_intent_hints(question)
+
+
+def categorize_sql_error(error_message: str) -> str:
+    """
+    Categorize a SQL error message into an error type.
+
+    Args:
+        error_message: The error message from the database
+
+    Returns:
+        Error type string (e.g., 'column_not_found', 'syntax_error')
+    """
+    error_lower = error_message.lower()
+
+    for error_type, patterns in ERROR_TAXONOMY.items():
+        for pattern in patterns:
+            if re.search(pattern, error_lower, re.IGNORECASE):
+                logger.info(f"Categorized error: {error_type} (matched pattern: {pattern})")
+                return error_type
+
+    logger.warning(f"Unknown error type, defaulting to 'syntax_error': {error_message[:100]}")
+    return "syntax_error"
+
+
+def get_fix_for_error(error_type: str, sql: str, question: str) -> str:
+    """
+    Get a suggested fix prompt for a given error type.
+
+    Args:
+        error_type: The categorized error type
+        sql: The current SQL that failed
+        question: The original question
+
+    Returns:
+       Suggestion string for the LLM to fix the SQL
+    """
+    fixes = {
+        "column_not_found": (
+            "The SQL failed because a column reference is invalid. "
+            "Possible issues: 1) Column doesn't exist - check schema; "
+            "2) Need table prefix (e.g., table.column); "
+            "3) Wrong table - verify JOINs. "
+            "Rewrite the SQL with correct column/table names from the schema."
+        ),
+        "table_not_found": (
+            "The SQL references a table that doesn't exist. "
+            "Use only tables shown in the schema above. "
+            "Check table names and verify correct JOINs."
+        ),
+        "operator_mismatch": (
+            "The SQL uses an invalid operator for the column type. "
+            "Check: 1) Use ILIKE for text pattern matching; "
+            "2) Use proper comparison operators (=, <, >, <=, >=); "
+            "3) For dates, use proper date syntax."
+        ),
+        "type_mismatch": (
+            "The SQL has a type mismatch. "
+            "Fix by: 1) Cast types explicitly (e.g., column::integer); "
+            "2) Use compatible operators; "
+            "3) Wrap in COALESCE for NULL handling."
+        ),
+        "syntax_error": (
+            "The SQL has a syntax error. "
+            "Check: 1) Matching quotes, parentheses; "
+            "2) Proper comma placement; "
+            "3) Valid SQL keywords. "
+            "Rewrite with correct syntax."
+        ),
+        "missing_group_by": (
+            "The SQL uses aggregate functions without GROUP BY. "
+            "When using COUNT/SUM/AVG with 'per/each/by', add GROUP BY. "
+            "Rewrite with appropriate GROUP BY clause."
+        ),
+        "ambiguous_column": (
+            "Column reference is ambiguous (exists in multiple tables). "
+            "Use table prefix: table.column_name. "
+            "Rewrite with qualified column names."
+        ),
+        "excessive_rows": (
+            "The query returns too many rows (>1000). "
+            "For questions like 'highest', 'top', 'first', add LIMIT. "
+            "Add ORDER BY + LIMIT for ranking queries."
+        ),
+    }
+
+    return fixes.get(error_type, "Fix the SQL syntax error and try again.")
+
+
+def execute_sql_dry_run(conn, sql: str) -> tuple[bool, Optional[int], Optional[str]]:
+    """
+    Execute SQL to validate it runs without errors.
+
+    Args:
+        conn: Database connection
+        sql: SQL query to validate
+
+    Returns:
+        Tuple of (success, row_count, error_message)
+    """
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            row_count = len(rows)
+            logger.info(f"Dry-run executed successfully, {row_count} rows returned")
+            return True, row_count, None
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"Dry-run failed: {error_msg}")
+            return False, None, error_msg
+        finally:
+            cursor.close()
+    except Exception as e:
+        logger.warning(f"Connection error during dry-run: {e}")
+        return False, None, str(e)
+
+
+def validate_sql_with_execution(
+    sql: str,
+    question: str,
+    conn,
+    auto_fix: bool = True,
+) -> ValidationResult:
+    """
+    Validate SQL with dry-run execution.
+
+    Args:
+        sql: Generated SQL query
+        question: User's original question
+        conn: Database connection
+        auto_fix: Whether to auto-fix issues
+
+    Returns:
+        ValidationResult with validation results including execution feedback
+    """
+    validator = SQLValidator(question, sql)
+    static_result = validator.validate()
+
+    success, row_count, error = execute_sql_dry_run(conn, sql)
+
+    if not success and error:
+        error_type = categorize_sql_error(error)
+        suggested_fix = get_fix_for_error(error_type, sql, question)
+
+        return ValidationResult(
+            sql=sql,
+            is_valid=False,
+            issues=static_result.issues + [f"Execution error: {error}"],
+            fixes_applied=static_result.fixes_applied,
+            detected_intents=static_result.detected_intents,
+            error_type=error_type,
+            suggested_fix=suggested_fix,
+            execution_error=error,
+            row_count=None,
+        )
+
+    if success and row_count is not None and row_count > MAX_ROWS_THRESHOLD:
+        limit = extract_limit_from_question(question)
+        if not limit:
+            suggested_fix = get_fix_for_error("excessive_rows", sql, question)
+            return ValidationResult(
+                sql=sql,
+                is_valid=False,
+                issues=static_result.issues + [f"Returns {row_count} rows (> {MAX_ROWS_THRESHOLD})"],
+                fixes_applied=static_result.fixes_applied,
+                detected_intents=static_result.detected_intents,
+                error_type="excessive_rows",
+                suggested_fix=suggested_fix,
+                execution_error=None,
+                row_count=row_count,
+            )
+
+    return ValidationResult(
+        sql=static_result.sql,
+        is_valid=static_result.is_valid,
+        issues=static_result.issues,
+        fixes_applied=static_result.fixes_applied,
+        detected_intents=static_result.detected_intents,
+        error_type=None,
+        suggested_fix=None,
+        execution_error=None,
+        row_count=row_count,
+    )
 
 
 if __name__ == "__main__":

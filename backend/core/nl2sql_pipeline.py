@@ -27,7 +27,7 @@ from .sql_prompt import (
     build_sql_generation_prompt,
     build_two_pass_prompt,
 )
-from .validator import validate_sql
+from .validator import validate_sql, validate_sql_with_execution
 
 
 ProgressCallback = Callable[[str, str, str, dict[str, Any]], None]
@@ -226,14 +226,15 @@ def _llm_invoke(state: GraphState, prompt: str) -> str:
     return _strip_sql_fences(response.content)
 
 
-def fix_sql_with_error(state: GraphState, sql: str, error_msg: str, schema: str) -> str:
+def fix_sql_with_error(state: GraphState, sql: str, error_msg: str, schema: str, suggested_fix: str = None) -> str:
+    fix_hint = f"\nSuggested fix: {suggested_fix}" if suggested_fix else ""
     prompt = f"""You are a PostgreSQL SQL expert. The following SQL query has an error:
 
 Original SQL:
 {sql}
 
 Error Message:
-{error_msg}
+{error_msg}{fix_hint}
 
 Current Database Schema:
 {schema}
@@ -535,7 +536,20 @@ def generate_sql(state: GraphState) -> GraphState:
         _emit_progress(state, "schema_linking_complete", "Schema linking complete")
         sql = initial_sql
 
-    validation_result = validate_sql(sql, question)
+    db_id = state.get("db_id")
+    if db_id and state.get("profile_cache"):
+        conn = get_connection(db_id)
+        try:
+            validation_result = validate_sql_with_execution(sql, question, conn)
+            if not validation_result.is_valid and validation_result.suggested_fix:
+                state["_validation_error"] = validation_result.execution_error
+                state["_error_type"] = validation_result.error_type
+                state["_suggested_fix"] = validation_result.suggested_fix
+        finally:
+            conn.close()
+    else:
+        validation_result = validate_sql(sql, question)
+
     state["sql_query"] = validation_result.sql
     _emit_progress(state, "sql_validated", "SQL validated")
     return state
@@ -656,7 +670,7 @@ def execute_sql(state: GraphState) -> GraphState:
                 return state
 
             state["sql_query"] = fix_sql_with_error(
-                state, sql, error_msg, state.get("schema", "")
+                state, sql, error_msg, state.get("schema", ""), state.get("_suggested_fix")
             )
 
     state["error"] = f"Error: Max iterations ({max_iterations}) exceeded"
