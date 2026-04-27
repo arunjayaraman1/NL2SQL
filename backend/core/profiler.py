@@ -302,125 +302,108 @@ def profile_column(
     primary_keys: set[str],
     foreign_keys: dict[str, str],
 ) -> ProfileColumn:
-    """Profile a single column."""
-    cursor = conn.cursor()
+    """Profile a single column using aggregate SQL queries (no full-table scan)."""
     data_type = get_column_type(conn, schema, table_name, column_name)
-
+    is_json = _is_json_type(data_type)
+    cursor = conn.cursor()
     try:
-        stmt = _sql.SQL("SELECT {} FROM {}").format(
-            _sql.Identifier(column_name), _ident(schema, table_name)
-        )
+        # Row counts and distinct count in one pass.
+        stmt = _sql.SQL(
+            "SELECT COUNT(*), COUNT({col}), COUNT(DISTINCT {col}) FROM {tbl}"
+        ).format(col=_sql.Identifier(column_name), tbl=_ident(schema, table_name))
         cursor.execute(stmt)
-        all_values = [row[0] for row in cursor.fetchall()]
+        total_count, non_null_count, distinct_count = cursor.fetchone()
+        null_count = total_count - non_null_count
+        null_percentage = round(null_count / total_count * 100, 1) if total_count > 0 else 0.0
 
-        total_count = len(all_values)
-        non_null_values = [v for v in all_values if v is not None]
-        null_count = total_count - len(non_null_values)
-        null_percentage = (null_count / total_count * 100) if total_count > 0 else 0
+        # Top-5 most frequent values.  For JSON columns use a simple LIMIT
+        # fetch because GROUP BY on jsonb is expensive and rarely meaningful.
+        samples: list[str] = []
+        if non_null_count > 0:
+            if is_json:
+                stmt = _sql.SQL(
+                    "SELECT {col}::text FROM {tbl} WHERE {col} IS NOT NULL LIMIT 5"
+                ).format(col=_sql.Identifier(column_name), tbl=_ident(schema, table_name))
+                cursor.execute(stmt)
+                samples = [row[0] for row in cursor.fetchall()]
+            else:
+                stmt = _sql.SQL("""
+                    SELECT {col}, COUNT(*) AS cnt
+                    FROM (SELECT {col} FROM {tbl} LIMIT 50000) _s
+                    WHERE {col} IS NOT NULL
+                    GROUP BY {col}
+                    ORDER BY cnt DESC
+                    LIMIT 5
+                """).format(
+                    col=_sql.Identifier(column_name), tbl=_ident(schema, table_name)
+                )
+                cursor.execute(stmt)
+                samples = [str(row[0]) for row in cursor.fetchall()]
 
-        def make_hashable(v):
-            if isinstance(v, (list, dict)):
-                return json.dumps(v, sort_keys=True)
-            return v
+        # Range stats via dedicated aggregate queries (avoids fetching all rows).
+        min_value: Optional[str] = None
+        max_value: Optional[str] = None
+        avg_length: Optional[float] = None
+        type_lower = data_type.lower()
 
-        hashable_values = [make_hashable(v) for v in non_null_values]
-        distinct_values = set(hashable_values)
-        distinct_count = len(distinct_values)
-
-        samples = []
-        if distinct_count > 0:
-            value_counts: dict = {}
-            for v in non_null_values:
-                hv = make_hashable(v)
-                value_counts[hv] = value_counts.get(hv, 0) + 1
-            sorted_values = sorted(
-                value_counts.items(), key=lambda x: x[1], reverse=True
+        if any(t in type_lower for t in ["integer", "numeric", "decimal", "real", "double", "bigint", "smallint", "serial"]):
+            stmt = _sql.SQL("SELECT MIN({col}), MAX({col}) FROM {tbl}").format(
+                col=_sql.Identifier(column_name), tbl=_ident(schema, table_name)
             )
-            samples = [str(v[0]) for v in sorted_values[:5]]
+            cursor.execute(stmt)
+            row = cursor.fetchone()
+            if row[0] is not None:
+                min_value, max_value = str(row[0]), str(row[1])
 
-        is_json = _is_json_type(data_type)
+        elif any(t in type_lower for t in ["date", "time", "timestamp"]):
+            stmt = _sql.SQL("SELECT MIN({col}), MAX({col}) FROM {tbl}").format(
+                col=_sql.Identifier(column_name), tbl=_ident(schema, table_name)
+            )
+            cursor.execute(stmt)
+            row = cursor.fetchone()
+            if row[0] is not None:
+                min_v = row[0].date() if hasattr(row[0], "date") else row[0]
+                max_v = row[1].date() if hasattr(row[1], "date") else row[1]
+                min_value, max_value = str(min_v), str(max_v)
+
+        elif type_lower in ["character varying", "varchar", "character", "char", "text"]:
+            stmt = _sql.SQL(
+                "SELECT MIN(length({col})), MAX(length({col})), AVG(length({col}))"
+                " FROM {tbl} WHERE {col} IS NOT NULL"
+            ).format(col=_sql.Identifier(column_name), tbl=_ident(schema, table_name))
+            cursor.execute(stmt)
+            row = cursor.fetchone()
+            if row[0] is not None:
+                min_value, max_value = str(row[0]), str(row[1])
+                avg_length = round(float(row[2]), 1)
+
+        # JSON key extraction from a small sample.
         json_keys: list[str] = []
-        if is_json and samples:
-            json_keys = _extract_json_keys(samples[:10])
-
-        min_value = None
-        max_value = None
-        avg_length = None
-
-        if non_null_values:
-            type_lower = data_type.lower()
-
-            if any(
-                t in type_lower
-                for t in ["integer", "numeric", "decimal", "real", "double"]
-            ):
-                numeric_values = [float(v) for v in non_null_values if _is_numeric(v)]
-                if numeric_values:
-                    min_value = str(min(numeric_values))
-                    max_value = str(max(numeric_values))
-
-            elif any(t in type_lower for t in ["date", "time", "timestamp"]):
-                date_values = [v for v in non_null_values if isinstance(v, (datetime,))]
-                if date_values:
-                    min_value = (
-                        str(min(date_values).date())
-                        if hasattr(min(date_values), "date")
-                        else str(min(date_values))
-                    )
-                    max_value = (
-                        str(max(date_values).date())
-                        if hasattr(max(date_values), "date")
-                        else str(max(date_values))
-                    )
-
-            if type_lower in [
-                "character varying",
-                "varchar",
-                "character",
-                "char",
-                "text",
-            ]:
-                str_values = [str(v) for v in non_null_values if v is not None]
-                if str_values:
-                    lengths = [len(v) for v in str_values]
-                    avg_length = sum(lengths) / len(lengths)
-                    if len(lengths) == 1:
-                        min_value = str(lengths[0])
-                        max_value = str(lengths[0])
-                    else:
-                        min_value = str(min(lengths))
-                        max_value = str(max(lengths))
-
-        is_pk = column_name in primary_keys
-        fk = foreign_keys.get(column_name)
+        if is_json and non_null_count > 0:
+            stmt = _sql.SQL(
+                "SELECT {col}::text FROM {tbl} WHERE {col} IS NOT NULL LIMIT 10"
+            ).format(col=_sql.Identifier(column_name), tbl=_ident(schema, table_name))
+            cursor.execute(stmt)
+            json_keys = _extract_json_keys([row[0] for row in cursor.fetchall()])
 
         return ProfileColumn(
             name=column_name,
             data_type=data_type,
             total_count=total_count,
             null_count=null_count,
-            null_percentage=round(null_percentage, 1),
+            null_percentage=null_percentage,
             distinct_count=distinct_count,
             samples=samples,
             min_value=min_value,
             max_value=max_value,
-            avg_length=round(avg_length, 1) if avg_length else None,
-            is_primary_key=is_pk,
-            foreign_key=fk,
+            avg_length=avg_length,
+            is_primary_key=column_name in primary_keys,
+            foreign_key=foreign_keys.get(column_name),
             is_json_type=is_json,
             json_keys=json_keys,
         )
-
     finally:
         cursor.close()
-
-
-def _is_numeric(value) -> bool:
-    try:
-        float(value)
-        return True
-    except (TypeError, ValueError):
-        return False
 
 
 def _extract_json_keys(sampled_values: list, max_keys: int = 20) -> list[str]:

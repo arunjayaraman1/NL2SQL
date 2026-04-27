@@ -149,7 +149,7 @@ EXAMPLE_VALUES = {
 def generate_few_shot_examples() -> list[FewShotExample]:
     """
     Generate few-shot examples for SQL generation.
-    Reduced to 5 diverse examples covering core patterns.
+    Includes HR examples + JSONB nested examples for medical databases.
     """
     examples: list[FewShotExample] = [
         {
@@ -169,13 +169,28 @@ WHERE d.name = 'Engineering' AND e.is_active = TRUE
 ORDER BY e.last_name;""",
         },
         {
-            "question": "What is the average salary by department?",
-            "sql": """SELECT d.name AS department, ROUND(AVG(e.salary), 2) AS average_salary
-FROM departments d
-LEFT JOIN employees e ON d.id = e.department_id
-WHERE e.salary IS NOT NULL
-GROUP BY d.id, d.name
-ORDER BY average_salary DESC;""",
+            "question": "Find patients with diabetes",
+            "sql": """SELECT first_name, last_name, medical_history->'conditions' AS conditions
+FROM patients
+WHERE medical_history->'conditions' @> '["Diabetes"]'::jsonb;""",
+        },
+        {
+            "question": "Show patients who had knee replacement surgery",
+            "sql": """SELECT first_name, last_name, medical_history->'surgeries' AS surgeries
+FROM patients
+WHERE medical_history->'surgeries' @> '["Knee Replacement"]'::jsonb;""",
+        },
+        {
+            "question": "Find patients with penicillin allergy",
+            "sql": """SELECT first_name, last_name, allergies->'drug_allergies' AS drug_allergies
+FROM patients
+WHERE allergies->'drug_allergies' @> '["Penicillin"]'::jsonb;""",
+        },
+        {
+            "question": "List patients with any surgeries",
+            "sql": """SELECT first_name, last_name, medical_history->'surgeries' AS surgeries
+FROM patients
+WHERE jsonb_array_length(medical_history->'surgeries') > 0;""",
         },
         {
             "question": "Show top 5 highest paid employees",

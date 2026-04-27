@@ -4,8 +4,10 @@ services:
     container_name: nl2sql-db
     environment:
       POSTGRES_DB: ${DB_NAME:-hr_db}
-      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_USER: ${DB_USER:-newpage}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    env_file:
+      - .env
     ports:
       - "5432:5432"
     volumes:
@@ -17,8 +19,10 @@ services:
       - ./docker/db/init/pharma_schema.sql:/docker-entrypoint-initdb.d/pharma_schema.sql:ro
       - ./docker/db/init/pharma_data.sql:/docker-entrypoint-initdb.d/pharma_data.sql:ro
       - ./docker/db/init/pharma_data_simple.sql:/docker-entrypoint-initdb.d/pharma_data_simple.sql:ro
+      - ./docker/db/init/medical_schema.sql:/docker-entrypoint-initdb.d/medical_schema.sql:ro
+      - ./docker/db/init/medical_data.sql:/docker-entrypoint-initdb.d/medical_data.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-hr_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-newpage} -d ${DB_NAME:-hr_db}"]
       interval: 5s
       timeout: 5s
       retries: 10

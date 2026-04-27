@@ -18,9 +18,11 @@ from langgraph.graph import END, StateGraph
 
 from .db_registry import get_connection
 from .graph_spec import build_fallback_graph_spec, validate_graph_spec
+from .jsonb_formatter import format_results as format_jsonb_results
 from .profiler import ProfileCache, format_profiled_schema, profile_database
 from .schema_linker import link_schema
 from .sql_prompt import (
+    build_classification_prompt,
     build_profiled_schema_prompt,
     build_sql_generation_prompt,
     build_two_pass_prompt,
@@ -48,6 +50,10 @@ class GraphState(TypedDict, total=False):
     graph_hint: str
     graph_spec: dict[str, Any]
 
+    is_query: bool
+    conversation_response: str
+
+    conversation_history: Optional[list[dict]]  # [{question, sql, summary}]
     profile_cache: Optional[ProfileCache]
     summary_cache: Optional[Any]
     force_refresh: bool
@@ -86,7 +92,6 @@ def _strip_markdown_fences(text: str) -> str:
     if text.startswith("```") and text.endswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3:
-            # Drop fence markers and optional language line (e.g. ```text)
             core = "\n".join(lines[1:-1]).strip()
             if core.lower().startswith(("text\n", "markdown\n")):
                 core = core.split("\n", 1)[1].strip()
@@ -94,16 +99,92 @@ def _strip_markdown_fences(text: str) -> str:
     return text
 
 
-def _should_enable_jsonb_querying(profile_cache: Optional[ProfileCache]) -> bool:
+def classify_input(state: GraphState) -> GraphState:
+    """Node 0: classify input as query or conversation using LLM."""
+    llm_builder = state.get("llm_builder")
+    if not callable(llm_builder):
+        state["is_query"] = True
+        state["conversation_response"] = ""
+        return state
+
+    question = state.get("question", "")
+    prompt = build_classification_prompt(question)
+
+    try:
+        llm = llm_builder()
+        response = llm.invoke(prompt)
+        intent = response.content.strip().lower()
+
+        if "query" in intent:
+            state["is_query"] = True
+            state["conversation_response"] = ""
+        else:
+            state["is_query"] = False
+            state["conversation_response"] = _build_conversation_response(question)
+    except Exception:
+        state["is_query"] = True
+        state["conversation_response"] = ""
+
+    return state
+
+
+def _build_conversation_response(question: str) -> str:
+    q_lower = question.lower().strip()
+
+    greetings = ["hi", "hello", "hey", "greetings", "hi there", "hello!"]
+    if q_lower in greetings or any(g in q_lower for g in greetings):
+        return "Hello! I'm here to help you query your database. Ask me anything like 'show me all customers' or 'count employees by department'."
+
+    help_keywords = ["help", "what can you do", "how does this work", "commands"]
+    if any(k in q_lower for k in help_keywords):
+        return "I can help you query your database using natural language. Try questions like 'show all tables', 'list customers from Boston', or 'count orders by status'."
+
+    return "I can help you query your database. Just ask me questions like 'show me all patients' or 'find employees in Engineering'."
+
+
+def respond_conversation(state: GraphState) -> GraphState:
+    """Node: handle conversational input (non-query)."""
+    response = state.get("conversation_response", "Hello! How can I help you?")
+    state["result"] = response
+    state["summary"] = response
+    state["graph_hint"] = "none"
+    state["graph_spec"] = {"chart_type": "none", "x_key": "", "y_keys": []}
+    state["columns"] = []
+    state["data"] = []
+    _emit_progress(state, "conversation_response", "Conversation response")
+    return state
+
+
+def _should_enable_jsonb_querying(
+    profile_cache: Optional[ProfileCache], question: str = ""
+) -> bool:
+    """Return True only when the question is likely about a JSON/JSONB column.
+
+    Collects all JSON column names and their extracted top-level keys from the
+    profile cache, then checks whether any of those terms appear in the
+    question.  This avoids injecting JSONB hints for purely relational queries
+    on databases that happen to have a JSON column somewhere.
+    """
     if profile_cache is None:
         return False
 
+    json_terms: list[str] = []
     for table in profile_cache.tables.values():
-        for column in table.columns.values():
+        for col_name, column in table.columns.items():
             data_type = str(getattr(column, "data_type", "")).lower()
             if "json" in data_type:
-                return True
-    return False
+                json_terms.append(col_name.lower())
+                for key in getattr(column, "json_keys", []):
+                    json_terms.append(str(key).lower())
+
+    if not json_terms:
+        return False
+
+    if not question:
+        return True
+
+    q_lower = question.lower()
+    return any(term in q_lower for term in json_terms)
 
 
 def is_retryable_error(error_msg: str) -> bool:
@@ -310,6 +391,80 @@ Rules:
     return fallback
 
 
+def generate_summary_and_graph_spec(
+    state: GraphState, question: str, columns: list[str], data: list[dict]
+) -> tuple[str, dict[str, Any]]:
+    summary_fallback = generate_summary(question, columns, data)
+    spec_fallback = build_fallback_graph_spec(columns, data)
+    spec_fallback["source"] = "heuristic"
+
+    llm_builder = state.get("llm_builder")
+    if not callable(llm_builder):
+        return summary_fallback, spec_fallback
+
+    payload_text = _build_summary_payload(columns, data)
+    prompt = f"""You analyze SQL query results and return a JSON object with two fields.
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "summary": "<1-2 sentence plain-text answer>",
+  "graph_spec": {{
+    "chart_type": "bar|line|pie|none",
+    "x_key": "<column name or empty string>",
+    "y_keys": ["<numeric column>"]
+  }}
+}}
+
+User question:
+{question}
+
+Result metadata:
+- row_count: {len(data)}
+- columns: {columns}
+
+Result sample (JSON, possibly truncated):
+{payload_text}
+
+Rules for summary:
+- Answer the question directly in 1-2 short sentences.
+- If the question can be answered with yes/no, start with Yes or No.
+- Use only the provided result data.
+- Do not mention SQL, query generation, or assumptions.
+- Plain text only (no markdown, no bullet points).
+
+Rules for graph_spec:
+- Use only listed columns for x_key and y_keys.
+- y_keys must be numeric columns only.
+- Use line for time-series trends, bar for categorical comparisons, pie for small part-to-whole.
+- Prefer a single metric for pie charts.
+- If data is not chartable, return chart_type "none" with empty string x_key and empty y_keys array.
+
+Output plain JSON only — no markdown fences, no explanation outside the JSON object."""
+
+    summary = summary_fallback
+    graph_spec = spec_fallback
+    try:
+        llm = llm_builder()
+        response = llm.invoke(prompt)
+        raw = str(getattr(response, "content", ""))
+        parsed = _extract_json_object(raw)
+        if parsed:
+            raw_summary = " ".join(str(parsed.get("summary", "")).split()).strip()
+            raw_summary = _strip_markdown_fences(raw_summary)
+            if raw_summary:
+                summary = raw_summary
+            raw_spec = parsed.get("graph_spec")
+            if isinstance(raw_spec, dict):
+                validated = validate_graph_spec(raw_spec, columns, data)
+                if validated:
+                    validated["source"] = "llm"
+                    graph_spec = validated
+    except Exception:
+        pass
+
+    return summary, graph_spec
+
+
 def fetch_schema(state: GraphState) -> GraphState:
     """Node 1: fetch or build profiled schema text."""
     if state.get("profile_cache") is not None and state.get("schema"):
@@ -340,8 +495,9 @@ def fetch_schema(state: GraphState) -> GraphState:
 def generate_sql(state: GraphState) -> GraphState:
     """Node 2: generate SQL, then refine with schema linking + validator."""
     question = state.get("question", "")
+    history = state.get("conversation_history") or []
 
-    jsonb_enabled = _should_enable_jsonb_querying(state.get("profile_cache"))
+    jsonb_enabled = _should_enable_jsonb_querying(state.get("profile_cache"), question)
 
     if state.get("profile_cache"):
         prompt = build_profiled_schema_prompt(
@@ -349,12 +505,14 @@ def generate_sql(state: GraphState) -> GraphState:
             question,
             summary_cache=state.get("summary_cache"),
             enable_jsonb_querying=jsonb_enabled,
+            conversation_history=history,
         )
     else:
         prompt = build_sql_generation_prompt(
             state.get("schema", ""),
             question,
             enable_jsonb_querying=jsonb_enabled,
+            conversation_history=history,
         )
 
     initial_sql = _llm_invoke(state, prompt)
@@ -365,7 +523,13 @@ def generate_sql(state: GraphState) -> GraphState:
             initial_sql, state["profile_cache"], state.get("summary_cache")
         )
         _emit_progress(state, "schema_linking_complete", "Schema linking complete")
-        refined_prompt = build_two_pass_prompt(initial_sql, filtered_schema, question)
+        refined_prompt = build_two_pass_prompt(
+            initial_sql,
+            filtered_schema,
+            question,
+            enable_jsonb_querying=jsonb_enabled,
+            conversation_history=history,
+        )
         sql = _llm_invoke(state, refined_prompt)
     else:
         _emit_progress(state, "schema_linking_complete", "Schema linking complete")
@@ -439,21 +603,20 @@ def execute_sql(state: GraphState) -> GraphState:
                 return state
 
             data = [dict(zip(columns, row)) for row in rows]
+
+            profile_cache = state.get("profile_cache")
+            if profile_cache:
+                data, columns = format_jsonb_results(data, columns, profile_cache)
+
             state["columns"] = columns
             state["data"] = data
             _emit_progress(state, "query_executed", "Query executed")
-            try:
-                state["summary"] = generate_conversational_summary(
-                    state, state.get("question", ""), columns, data
-                )
-            except Exception:
-                state["summary"] = generate_summary(
-                    state.get("question", ""), columns, data
-                )
-            _emit_progress(state, "summary_generated", "Summary generated")
-            graph_spec = generate_graph_spec(
-                state, state.get("question", ""), columns, data
+            question = state.get("question", "")
+            summary, graph_spec = generate_summary_and_graph_spec(
+                state, question, columns, data
             )
+            state["summary"] = summary
+            _emit_progress(state, "summary_generated", "Summary generated")
             state["graph_spec"] = graph_spec
             _emit_progress(
                 state, "chart_recommendation_generated", "Chart recommendation generated"
@@ -509,14 +672,31 @@ def execute_sql(state: GraphState) -> GraphState:
 def run_pipeline(question: str, initial_state: Optional[GraphState] = None) -> GraphState:
     """Build and execute the LangGraph workflow."""
     workflow = StateGraph(GraphState)
+    workflow.add_node("classify_input", classify_input)
     workflow.add_node("fetch_schema", fetch_schema)
     workflow.add_node("generate_sql", generate_sql)
     workflow.add_node("execute_sql", execute_sql)
+    workflow.add_node("respond_conversation", respond_conversation)
 
-    workflow.set_entry_point("fetch_schema")
+    workflow.set_entry_point("classify_input")
+
+    def route_by_classification(state: GraphState) -> str:
+        if state.get("is_query", True):
+            return "fetch_schema"
+        return "respond_conversation"
+
+    workflow.add_conditional_edges(
+        "classify_input",
+        route_by_classification,
+        {
+            "fetch_schema": "fetch_schema",
+            "respond_conversation": "respond_conversation",
+        }
+    )
     workflow.add_edge("fetch_schema", "generate_sql")
     workflow.add_edge("generate_sql", "execute_sql")
     workflow.add_edge("execute_sql", END)
+    workflow.add_edge("respond_conversation", END)
 
     compiled = workflow.compile()
 
@@ -533,6 +713,8 @@ def run_pipeline(question: str, initial_state: Optional[GraphState] = None) -> G
             graph_hint="none",
             graph_spec={"chart_type": "none", "x_key": "", "y_keys": []},
             profile_cache=None,
+            is_query=True,
+            conversation_response="",
         )
 
     initial_state["question"] = question

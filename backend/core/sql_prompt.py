@@ -125,13 +125,28 @@ POSTGRES_HINTS = """PostgreSQL dialect (target database):
   because search_path is configured across every user schema.
 """
 
-POSTGRES_JSONB_HINTS = """PostgreSQL JSONB hints:
-- Use -> to extract JSON object/array values and ->> to extract text values.
-- Use #> and #>> for nested JSON path extraction.
-- Use @> for JSONB containment filters (e.g. metadata @> '{"status":"active"}'::jsonb).
-- Use ? to check key existence, and ?| / ?& for any/all key checks.
-- Use jsonb_array_elements(...) to unnest JSON arrays when needed.
-- Cast extracted text values when comparing numerically or by date/time.
+POSTGRES_JSONB_HINTS = """PostgreSQL JSONB hints for nested JSON and arrays:
+
+NESTED JSON ACCESS:
+- Use column->'key' to extract nested values (returns JSONB)
+- Use column->>'key' to extract nested values as text
+- Use column->0 or column->-1 to access array elements by index
+
+JSONB ARRAY FILTERING:
+- Find patients with Diabetes: WHERE medical_history->'conditions' @> '["Diabetes"]'::jsonb
+- Non-empty surgeries: WHERE jsonb_array_length(medical_history->'surgeries') > 0
+- Penicillin allergy: WHERE allergies->'drug_allergies' @> '["Penicillin"]'::jsonb
+- Key existence: WHERE column ? 'key_name'
+
+IMPORTANT - Array Containment Syntax:
+- ALWAYS cast comparison value to JSONB: column @> '["search_term"]'::jsonb
+- Do NOT use: column = '["search_term"]' (that's text comparison)
+
+EXAMPLES:
+- conditions: medical_history->'conditions'
+- surgeries: medical_history->'surgeries'  
+- drug_allergies: allergies->'drug_allergies'
+
 """
 
 
@@ -159,6 +174,7 @@ def build_sql_generation_prompt(
     include_dialect_hints: bool | None = None,
     enable_jsonb_querying: bool = False,
     literal_cache=None,
+    conversation_history: list[dict] | None = None,
 ) -> str:
     """
     Build the full user prompt for SQL generation.
@@ -180,8 +196,17 @@ def build_sql_generation_prompt(
     intent_block = f"\n{intent_hints}\n" if intent_hints else ""
     literal_block = f"\n{literal_hints}\n" if literal_hints else ""
 
+    history_block = ""
+    if conversation_history:
+        lines = ["Recent conversation context (for follow-up questions):"]
+        for turn in conversation_history[-2:]:
+            lines.append(f"User: {turn.get('question', '')}")
+            if turn.get("sql"):
+                lines.append(f"SQL: {turn['sql']}")
+        history_block = "\n".join(lines) + "\n\n"
+
     return f"""You are a PostgreSQL SQL expert. Given the database schema below and a user question, output a single SELECT query that answers the question.
-{intent_block}{literal_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
+{intent_block}{literal_block}{history_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
 
 {few_shots}
 
@@ -213,6 +238,7 @@ def build_profiled_schema_prompt(
     summary_cache=None,
     include_dialect_hints: bool | None = None,
     enable_jsonb_querying: bool = False,
+    conversation_history: list[dict] | None = None,
 ) -> str:
     """
     Build the user prompt for SQL generation using profiled schema.
@@ -222,6 +248,8 @@ def build_profiled_schema_prompt(
         question: User's natural language question
         summary_cache: Optional ColumnSummaryCache from column_summarizer
         include_dialect_hints: Whether to include PostgreSQL dialect hints
+        enable_jsonb_querying: Whether to include JSONB syntax hints
+        conversation_history: Optional list of prior turns [{question, sql, summary}]
     """
     if include_dialect_hints is None:
         include_dialect_hints = _dialect_hints_enabled()
@@ -236,8 +264,17 @@ def build_profiled_schema_prompt(
     intent_hints = get_intent_hints(question)
     intent_block = f"\n{intent_hints}\n" if intent_hints else ""
 
+    history_block = ""
+    if conversation_history:
+        lines = ["Recent conversation context (for follow-up questions):"]
+        for turn in conversation_history[-2:]:
+            lines.append(f"User: {turn.get('question', '')}")
+            if turn.get("sql"):
+                lines.append(f"SQL: {turn['sql']}")
+        history_block = "\n".join(lines) + "\n\n"
+
     return f"""You are a PostgreSQL SQL expert. Given the database schema below and a user question, output a single SELECT query that answers the question.
-{intent_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
+{intent_block}{history_block}{dialect_block}{jsonb_block}Below are example questions and valid SQL for this same kind of schema (tables and relationships like in the schema section):
 {few_shots}
 
 Current database schema (authoritative; use only these tables and columns):
@@ -261,6 +298,10 @@ def build_two_pass_prompt(
     initial_sql: str,
     filtered_schema: str,
     question: str,
+    *,
+    include_dialect_hints: bool | None = None,
+    enable_jsonb_querying: bool = False,
+    conversation_history: list[dict] | None = None,
 ) -> str:
     """
     Build prompt for second pass with filtered schema (Schema Linking).
@@ -269,20 +310,37 @@ def build_two_pass_prompt(
     - The initial SQL
     - Only the relevant tables/columns (filtered schema)
     - The original question
-
-    The LLM can then verify and refine the SQL against the focused schema.
+    - Same PostgreSQL dialect hints as pass 1 (so the LLM doesn't "fix" valid syntax)
 
     Args:
         initial_sql: SQL generated in pass 1
         filtered_schema: Schema containing only used tables/columns
         question: Original user question
+        include_dialect_hints: Whether to include PostgreSQL dialect hints (default: env flag)
+        enable_jsonb_querying: Whether to include JSONB syntax hints
+        conversation_history: Optional list of prior turns [{question, sql, summary}]
 
     Returns:
         Prompt string for second pass
     """
+    if include_dialect_hints is None:
+        include_dialect_hints = _dialect_hints_enabled()
+
+    dialect_block = f"{POSTGRES_HINTS}\n\n" if include_dialect_hints else ""
+    jsonb_block = f"{POSTGRES_JSONB_HINTS}\n\n" if enable_jsonb_querying else ""
+
+    history_block = ""
+    if conversation_history:
+        lines = ["Recent conversation context (for follow-up questions):"]
+        for turn in conversation_history[-2:]:
+            lines.append(f"User: {turn.get('question', '')}")
+            if turn.get("sql"):
+                lines.append(f"SQL: {turn['sql']}")
+        history_block = "\n".join(lines) + "\n\n"
+
     return f"""You previously generated this SQL for the user's question:
 
-Question: {question}
+{history_block}Question: {question}
 
 Initial SQL:
 {initial_sql}
@@ -290,7 +348,7 @@ Initial SQL:
 Now you have a FILTERED schema containing ONLY the tables and columns that were actually used in the query above.
 Use this focused schema to verify and refine the SQL if needed.
 
-Filtered schema (only relevant tables/columns):
+{dialect_block}{jsonb_block}Filtered schema (only relevant tables/columns):
 {filtered_schema}
 
 Instructions:
@@ -302,3 +360,17 @@ Instructions:
 - Do NOT include explanations, markdown, or anything other than the SQL
 
 SQL:"""
+
+
+def build_classification_prompt(question: str) -> str:
+    return f"""Classify the following user input as "query" or "conversation".
+
+Input: {question}
+
+Respond with ONLY one word: "query" or "conversation"
+
+Definitions:
+- "query": user wants database information (data, counts, filters, reports, analytics, tables, schema, etc.)
+- "conversation": casual chat, greetings, help questions, meta-questions, or anything not requiring database access
+
+Response: """

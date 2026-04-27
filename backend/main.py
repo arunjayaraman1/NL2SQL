@@ -187,9 +187,16 @@ def _looks_like_clarification_payload(data: list[dict], columns: list[str]) -> b
 def _finalize_query_result(
     result: dict[str, Any], question: str, profile_cache: ProfileCache | None
 ) -> dict:
+    if result.get("is_query") == False:
+        return {
+            "response_type": "conversation",
+            "message": result.get("conversation_response", "Hello! How can I help you?"),
+        }
+
     suggestions = _build_clarification_suggestions(question, result, profile_cache)
     if result.get("error"):
         return {
+            "response_type": "query",
             "sql_query": result.get("sql_query", ""),
             "error": result["error"],
             "graph_spec": result.get(
@@ -214,6 +221,7 @@ def _finalize_query_result(
         data, columns
     )
     return {
+        "response_type": "query",
         "sql_query": result.get("sql_query", ""),
         "columns": columns,
         "data": data,
@@ -329,6 +337,26 @@ def refresh_profile(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _parse_conversation_history(request: dict) -> list[dict]:
+    """Extract and validate conversation_history from the request body."""
+    raw = request.get("conversation_history")
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for turn in raw:
+        if not isinstance(turn, dict):
+            continue
+        q = str(turn.get("question", "")).strip()
+        if not q:
+            continue
+        cleaned.append({
+            "question": q,
+            "sql": str(turn.get("sql", "")).strip(),
+            "summary": str(turn.get("summary", "")).strip(),
+        })
+    return cleaned[-10:]  # cap to last 10 turns
+
+
 @app.post("/api/query")
 def process_query(request: dict):
     question = (request.get("question") or "").strip()
@@ -337,6 +365,7 @@ def process_query(request: dict):
 
     db_id = _resolve_db_id(request)
     force_refresh = bool(request.get("refresh_profile", False))
+    history = _parse_conversation_history(request)
 
     try:
         cache = get_or_build_profile(db_id, force_refresh=force_refresh)
@@ -361,6 +390,9 @@ def process_query(request: dict):
         profile_cache=cache,
         force_refresh=force_refresh,
         cache_path=_cache_path_for(db_id),
+        is_query=True,
+        conversation_response="",
+        conversation_history=history or None,
     )
 
     result = run_pipeline(question, initial_state)
@@ -395,6 +427,8 @@ def process_query_stream(request: dict):
             )
         )
 
+    history = _parse_conversation_history(request)
+
     def worker() -> None:
         try:
             cache = get_or_build_profile(db_id, force_refresh=force_refresh)
@@ -417,6 +451,9 @@ def process_query_stream(request: dict):
                 force_refresh=force_refresh,
                 cache_path=_cache_path_for(db_id),
                 progress_callback=push_progress,
+                is_query=True,
+                conversation_response="",
+                conversation_history=history or None,
             )
 
             result = run_pipeline(question, initial_state)

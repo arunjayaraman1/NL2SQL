@@ -7,6 +7,7 @@ FastAPI share the same accuracy path.
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -125,9 +126,16 @@ if __name__ == "__main__":
         profile_cache=None,
         force_refresh=args.refresh_profile,
         cache_path=_cache_path_for(args.db_id),
+        is_query=True,
+        conversation_response="",
     )
 
     result = run_pipeline(question, initial_state)
+
+    if result.get("is_query") == False:
+        print("\n--- Response ---")
+        print(result.get("conversation_response", "Hello! How can I help you?"))
+        sys.exit(0)
 
     print("\n--- Generated SQL ---")
     print(result.get("sql_query", ""))
